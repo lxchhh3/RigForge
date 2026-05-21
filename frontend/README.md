@@ -2,7 +2,7 @@
 
 RigForge v2 compose UI — Vite + Vue 3 + TypeScript with Pinia, Vue Router, and Playwright. Talks to the Python pipeline via a FastAPI bridge.
 
-The modder's workflow: pick a target avatar, paste clothing FBX paths, uncheck the meshes (Blender-outliner view) and the blendshape channels they don't want, then assemble. Bones never surface in the UI — the units of user agency are the mesh and the blendshape channel.
+The modder's workflow: pick a target avatar, paste clothing FBX paths, uncheck the meshes (Blender-outliner view) they don't want, drop or adjust the DeformPercent (0–100) on each blendshape channel with a slider, then assemble — a live progress bar shows phase + status per clothing. Bones never surface in the UI — the units of user agency are the mesh and the blendshape channel.
 
 ## Scripts
 
@@ -41,6 +41,8 @@ rigforge serve --llm-ollama                 # use the real Ollama client (defaul
 
 `drop_blend_shape_channel_ids` / `target_drop_blend_shape_channel_ids` are arrays of channel SubDeformer ids (returned by inspect as `channel_id` on each entry of `blend_shape_channels`). The pipeline strips the channel node + connections referencing it; the owning BlendShape Deformer is preserved (it may carry other surviving channels).
 
+`blend_shape_channel_overrides` / `target_blend_shape_channel_overrides` are arrays of `{channel_id, deform_percent}`. The pipeline rewrites the channel's `DeformPercent` value in place — baking a baseline morph intensity into the assembled FBX (e.g. "ship the avatar with 30% BigBust always on"). The on-disk `deform_percent` is included in each inspect channel record so the FE slider opens at the file's actual baseline. If a channel id is in both the drop set and the override list, the drop wins.
+
 ## Compose flow
 
 ```
@@ -48,11 +50,11 @@ Compose.vue (/)
 ├── Avatar picker        ──► GET /api/avatars
 ├── TargetPanel          ──► GET /api/avatars/{id}/inspect
 │   ├── MeshList: armature header + parallel mesh checkboxes (strip target's bundled outfit)
-│   └── BlendShapeList: per-channel checkboxes + name filter (strip target's bundled morphs)
+│   └── BlendShapeList: per-channel checkbox + 0–100 DeformPercent slider + name filter
 ├── Add clothing path    ──► POST /api/clothings/inspect
 │   └── ClothingItem (one per added clothing)
 │       ├── MeshList: same outliner shape (strip unwanted clothing meshes)
-│       └── BlendShapeList: per-channel checkboxes (strip unwanted clothing morphs)
+│       └── BlendShapeList: same shape — drop or rebase each morph's default value
 └── Assemble             ──► POST /api/assemble/stream per clothing (NDJSON)
     ├── AssembleProgressList: per-clothing phase bar + most recent note
     └── Results panel: id + output_fbx path (final 'done' event)
@@ -70,7 +72,7 @@ frontend/
 ├── src/
 │   ├── components/
 │   │   ├── MeshList.vue       # the outliner — armature + mesh checkboxes
-│   │   ├── BlendShapeList.vue # flat per-channel checkboxes + name filter
+│   │   ├── BlendShapeList.vue # flat per-channel checkbox + 0-100 slider + name filter
 │   │   ├── TargetPanel.vue    # target avatar's mesh + blendshape list, top of compose page
 │   │   ├── ClothingItem.vue   # one added clothing — header + mesh + blendshape list
 │   │   ├── AssembleProgressList.vue # live phase bar + note per in-flight clothing
@@ -86,14 +88,14 @@ frontend/
 │   ├── App.vue
 │   └── main.ts
 └── tests/e2e/
-    ├── compose.spec.ts        # avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-drop UX
+    ├── compose.spec.ts        # avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-drop + slider UX, live progress
     └── landing.spec.ts        # history view + recent-runs panel
 ```
 
 ## Testing
 
 ```sh
-npm run test:e2e        # 15 Playwright tests, auto-starts dev server + mocks the API
+npm run test:e2e        # 17 Playwright tests, auto-starts dev server + mocks the API
 npx vue-tsc --noEmit    # type-check
 ```
 

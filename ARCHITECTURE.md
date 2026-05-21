@@ -33,17 +33,23 @@ clothing_ascii.fbx (text)
     │           │ miss                                  │
     │           ▼                                       │
     │       LLM.classify(bones)  ◄── one batched call ──┘
-    │           │
+    │           │   emits {role, verdict, drop_category?, new_parent_role?}
+    │           │   per bone — NEVER emits names. Naming is a deterministic
+    │           │   lookup against target_avatar.canonical_to_name[role].
     │           ▼
     │       validators (7 rules)
     │           │       │
     │           │ errs  │ clean
     │           ▼       ▼
     │       re-prompt   EditPlan.from_decisions(...)
-    │       (once)
+    │       (once)        drops   = {bone_id : verdict == "drop"}
+    │                     renames = {bone_id : target_name_for(role)} (if names differ)
+    │                     reparents = {bone_id : target_bone_id_for(new_parent_role)}
     │
-    ├──► Phase C: apply drops + renames as text edits on ASCII
-    │             (cross-avatar armature merge deferred to v1.1)
+    ├──► Phase C: apply drops + renames + reparents as text edits on ASCII;
+    │             in cross-avatar, also dedup materials/blendshapes by name,
+    │             apply user mesh/channel drops + DeformPercent overrides,
+    │             splice into target's Objects + Connections.
     │
     ▼
 assembled_ascii.fbx
@@ -65,7 +71,9 @@ rigforge/
 │   │                 indexes + bone_to_mesh_names() affinity helper
 │   └── edits.py      TextEdit primitives:
 │                       drop_bone_edits, rename_bone_edits, reparent_bone_edits,
-│                       drop_cluster_edits, drop_mesh_edits (v2)
+│                       drop_cluster_edits, drop_mesh_edits,
+│                       drop_blend_shape_channel_edits,
+│                       set_blend_shape_channel_deform_percent_edits (all v2)
 ├── canonical/
 │   ├── schema.py     CanonicalSchema (v2.1: core/arms/legs + fingers + twist)
 │   ├── decisions.py  Decision / DecisionSet (incl. new_parent_role)
@@ -89,10 +97,13 @@ rigforge/
 │   ├── phase_b.py    cache → LLM → validate → (re-prompt) → EditPlan;
 │   │                 applies user_drop_bone_ids pre-filter with subtree cascade
 │   ├── phase_c.py    apply edits (pass-through and cross-merge);
-│   │                 applies drop_mesh_ids (both branches) and
-│   │                 target_drop_mesh_ids / target_drop_bone_ids (cross only)
+│   │                 applies drop_mesh_ids + drop_blend_shape_channel_ids
+│   │                 + blend_shape_channel_overrides (DeformPercent) in
+│   │                 both branches; target_* counterparts in cross-merge only;
+│   │                 materials/blendshapes dedup-and-repoint in cross-merge
 │   ├── edit_plan.py  EditPlan.from_decisions (drops + renames + reparents)
-│   └── orchestrator.py  assemble() — full bin→ASCII→A→B→C→ASCII→bin
+│   └── orchestrator.py  assemble() — full bin→ASCII→A→B→C→ASCII→bin;
+│                     emits progress_cb(phase, note) at each phase boundary
 ├── sections/
 │   └── merge.py      merge_materials / merge_blendshapes (donor→target name
 │                     dedup primitives; Phase C cross-merge takes the inverse
@@ -180,10 +191,10 @@ Error → one re-prompt with violation text appended → second failure raises.
 
 | Path | Kind |
 |---|---|
-| `tests/test_*.py` | pytest — 307 tests, ~9m. HTTP mocked, FBX via fixtures. Covers lexer, sections + affinity, edits (incl. drop_mesh + drop_blend_shape_channel), validators, cache, merge primitives, Phase A/B/C (incl. cross-merge materials/blendshapes dedup and channel drops), the API endpoints (sync + streaming assemble), the LLM client + streaming NDJSON, and end-to-end on real Maya.fbx. |
+| `tests/test_*.py` | pytest — 319 tests, ~9m. HTTP mocked, FBX via fixtures. Covers lexer, sections + affinity, edits (incl. drop_mesh + drop_blend_shape_channel + set_blend_shape_channel_deform_percent), validators, cache, merge primitives, Phase A/B/C (incl. cross-merge materials/blendshapes dedup, channel drops, and DeformPercent overrides), the API endpoints (sync + streaming assemble), the LLM client + streaming NDJSON, and end-to-end on real Maya.fbx. |
 | `tests/test_e2e.py` | Full pipeline against `MockLLMClient` → binary compare vs Maya.fbx → must be identical. |
 | `tests/test_api.py` | TestClient against the FastAPI app: avatar/clothing inspect, assemble endpoint, mesh + bone drop forwarding. |
-| `frontend/tests/e2e/*.spec.ts` | Playwright — 15 specs covering compose flow (avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-channel drop UX, live progress + error events, history view). Auto-starts the dev server and mocks the API. |
+| `frontend/tests/e2e/*.spec.ts` | Playwright — 17 specs covering compose flow (avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-channel drop UX, blendshape DeformPercent slider, live progress + error events, history view). Auto-starts the dev server and mocks the API. |
 | `training/smoke_ollama.py` | Manual. Real Ollama, LLM-only (no Phase C). Spits keep/drop summary + validator output. |
 | `training/smoke_full_pipeline.py` | Manual. Real Ollama, full assemble(), fbx_compare vs Maya.fbx (synth-clothing fixture). |
 | `training/smoke_cross_merge_mock.py` | Manual. Mock LLM, exercises Phase C pass-through on a real clothing (ClassicChic_Moe → Moe). Should round-trip structurally identical. |
@@ -212,6 +223,7 @@ Error → one re-prompt with violation text appended → second failure raises.
 - **Compose UI** — `frontend/` Vue 3 / Pinia / Vue Router / Playwright. Modder picks an avatar, adds clothing FBX paths, unchecks meshes in a Blender-outliner-style list (armature header + parallel mesh checkboxes), assembles. Bones are never surfaced.
 - **Mesh-level user pre-filter** — `drop_mesh_edits` primitive cleanly strips Mesh-Model + Geometry + Skin + Clusters as one unit. Endpoint accepts `drop_mesh_ids` + `target_drop_mesh_ids`; Phase C applies them in both pass-through and cross-merge.
 - **Blendshape-channel user pre-filter** — `drop_blend_shape_channel_edits` primitive strips a BlendShapeChannel SubDeformer + connections referencing it (owning BlendShape Deformer preserved — may hold surviving siblings). Inspect surfaces `blend_shape_channels[]`; assemble accepts `drop_blend_shape_channel_ids` + `target_drop_blend_shape_channel_ids`; FE renders a flat per-channel checkbox list with a name filter (channels number in the hundreds on real avatars).
+- **DeformPercent override (blendshape slider)** — `set_blend_shape_channel_deform_percent_edits` primitive rewrites just the numeric `DeformPercent` token on a BlendShapeChannel (matches Maya's int-vs-%g formatting so diffs stay clean). Inspect returns each channel's on-disk `deform_percent` so the FE slider opens at the file's actual baseline. Assemble accepts `blend_shape_channel_overrides` + `target_blend_shape_channel_overrides` (list of `{channel_id, deform_percent}`). Channels in the corresponding drop set are silently skipped — drop wins. FE: 0-100 range slider beside each channel checkbox; snapping back to the on-disk value clears the override (keeps payloads clean); current value highlights yellow when overridden.
 - **Live assemble progress** — `assemble()` in `pipeline/orchestrator.py` takes an optional `progress_cb(phase, note)` invoked at phase boundaries. New `POST /api/assemble/stream` runs the pipeline on a worker thread and emits NDJSON events (`started` / `progress` / `heartbeat` / `done` / `error`) for the FE to read line-by-line. FE's `AssembleProgressList.vue` shows a 4-phase bar + most recent note per clothing in flight. Sync `POST /api/assemble` kept for CLI/scripted callers.
 - **Bone affinity helper** — `bone_to_mesh_names(view, bone_id)` walks the bone subtree (chain-root case) and the cluster→skin→geometry→model chain, filtering out the zero-weight clusters that Maya's rigging convention inserts. The inspect endpoint returns this per bone so power-user tooling has the right `bone → meshes` map.
 - **`user_drop_bone_ids` pre-filter in Phase B** — forces verdict=drop on user-checked bones and cascades to their subtree; the drop_safety validator skips `drop_category="user_dropped"` so high-weight user drops don't error.

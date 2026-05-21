@@ -213,6 +213,9 @@ D:/2files/models/vrc/CC/Blender-MHWilds/
 | FastAPI bridge | no | yes (landed) |
 | Compose UI: avatar pick → clothing list → mesh-level drops → assemble | no | yes (landed — v2's user-facing deliverable) |
 | User pre-filter (drop unwanted meshes from clothing AND target) | no | yes (landed) |
+| User pre-filter (drop unwanted blendshape channels from clothing AND target) | no | yes (landed) |
+| Per-channel DeformPercent override (bake baseline morph intensity) | no | yes (landed) |
+| Streaming assemble progress (NDJSON) + FE progress bar | no | yes (landed) |
 | Caching | yes | — |
 | Manifest emission | yes | — |
 | Mesh shape fitting | no | **out of scope** — clothing is assumed pre-fit |

@@ -2,7 +2,7 @@
 
 Standalone Python tool for MHWilds clothing modding. Takes a Booth-purchased clothing FBX rigged for some other base avatar, retargets it onto a curated avatar, and emits a clean assembly FBX that REE-ModPilot's Phase D pipeline consumes.
 
-The user-facing slice is a compose UI: pick an avatar, add clothing FBX paths, uncheck the meshes and blendshapes you don't want (target's bundled outfit + morphs on one side, unwanted clothing parts on the other), then assemble.
+The user-facing slice is a compose UI: pick an avatar, add clothing FBX paths, uncheck the meshes you don't want, drop or adjust the DeformPercent (0–100) on each blendshape with a slider, then assemble — a live progress bar shows phase + status per clothing.
 
 See [PLAN.md](PLAN.md) for the design doc + scope decisions, [ARCHITECTURE.md](ARCHITECTURE.md) for what's actually built, and [frontend/README.md](frontend/README.md) for the FE specifics.
 
@@ -46,8 +46,8 @@ The user's local paths are hardcoded in `tests/conftest.py` and `rigforge/ascii_
 ## Tests
 
 ```sh
-pytest                  # 307 backend tests (~9 min)
-cd frontend && npm run test:e2e   # 15 Playwright tests (~2 sec, mocked API)
+pytest                  # 319 backend tests (~9 min)
+cd frontend && npm run test:e2e   # 17 Playwright tests (~2 sec, mocked API)
 ```
 
 ## Repo layout
@@ -64,6 +64,6 @@ cd frontend && npm run test:e2e   # 15 Playwright tests (~2 sec, mocked API)
 
 ## Status
 
-v2 is complete. Bone reparenting, fingers/twist schema, materials/blendshapes dedup in Phase C cross-merge, compose UI, mesh-level + blendshape-channel user pre-filter, and the FastAPI bridge are all shipped.
+v2 is complete. Bone reparenting, fingers/twist schema, materials/blendshapes dedup in Phase C cross-merge, compose UI, mesh-level + blendshape-channel user pre-filter, per-channel DeformPercent override slider, streaming-progress assemble endpoint + FE progress bar, and the FastAPI bridge are all shipped.
 
 Stress validation: zero-shot DeepSeek V4 Flash classified 877 bones across 5 real Maya-rigged clothings with 0 high-weight drops and no validator re-prompts. Details in `data/training/_stress/REPORT.md` (gitignored — generated locally).
