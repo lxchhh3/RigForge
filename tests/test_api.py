@@ -339,6 +339,279 @@ def test_assemble_endpoint_forwards_mesh_drop_ids(
     assert captured["target_drop_mesh_ids"] == {700, 800, 900}
 
 
+def test_assemble_endpoint_forwards_blend_shape_channel_drop_ids(
+    assemble_client, maya_fbx_ascii: Path,
+):
+    """FE blendshape list sends channel SubDeformer ids. Endpoint must
+    forward them to the pipeline so drop_blend_shape_channel_edits runs."""
+    client, captured, _ = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+        "drop_blend_shape_channel_ids": [800, 801],
+        "target_drop_blend_shape_channel_ids": [900, 901, 902],
+    })
+    assert r.status_code == 200, r.text
+    assert captured["drop_blend_shape_channel_ids"] == {800, 801}
+    assert captured["target_drop_blend_shape_channel_ids"] == {900, 901, 902}
+
+
+def test_assemble_endpoint_omits_blend_shape_channel_drops_when_empty(
+    assemble_client, maya_fbx_ascii: Path,
+):
+    client, captured, _ = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+    })
+    assert r.status_code == 200
+    assert captured.get("drop_blend_shape_channel_ids") in (None, set())
+    assert captured.get("target_drop_blend_shape_channel_ids") in (None, set())
+
+
+def test_inspect_returns_blend_shape_channels(
+    client: TestClient, maya_fbx_ascii: Path,
+):
+    """Inspect must surface the channel list so the FE can render checkboxes.
+    Each item has channel_id + name + owner_id + owner_name."""
+    r = client.post("/api/clothings/inspect", json={"path": str(maya_fbx_ascii)})
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    channels = payload.get("blend_shape_channels")
+    assert isinstance(channels, list)
+    assert channels, "expected at least one channel in Maya.fbx"
+    sample = channels[0]
+    assert set(sample.keys()) >= {"channel_id", "name", "owner_id", "owner_name"}
+    # Sorted by (name, channel_id) — FE renders the flat list as-is
+    names = [c["name"] for c in channels]
+    assert names == sorted(names) or all(
+        names[i] <= names[i + 1] for i in range(len(names) - 1)
+    )
+
+
+def test_avatar_inspect_returns_blend_shape_channels(client: TestClient):
+    """Same shape on the avatar side so FE can render the target's morph list."""
+    r = client.get("/api/avatars/maya/inspect")
+    assert r.status_code == 200
+    payload = r.json()
+    assert isinstance(payload.get("blend_shape_channels"), list)
+
+
+def test_inspect_blend_shape_channels_include_deform_percent(
+    client: TestClient, maya_fbx_ascii: Path,
+):
+    """Each channel row must include the on-disk DeformPercent so the FE
+    slider can start at the file's actual value (not always 0)."""
+    r = client.post("/api/clothings/inspect", json={"path": str(maya_fbx_ascii)})
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    channels = payload["blend_shape_channels"]
+    assert channels
+    sample = channels[0]
+    assert "deform_percent" in sample
+    assert isinstance(sample["deform_percent"], (int, float))
+
+
+def test_assemble_endpoint_forwards_blend_shape_channel_overrides(
+    assemble_client, maya_fbx_ascii: Path,
+):
+    """FE slider sends {channel_id, deform_percent} per channel touched.
+    Endpoint must convert into a dict[int, float] for the orchestrator."""
+    client, captured, _ = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+        "blend_shape_channel_overrides": [
+            {"channel_id": 800, "deform_percent": 50},
+            {"channel_id": 801, "deform_percent": 33.5},
+        ],
+        "target_blend_shape_channel_overrides": [
+            {"channel_id": 900, "deform_percent": 75},
+        ],
+    })
+    assert r.status_code == 200, r.text
+    assert captured["blend_shape_channel_overrides"] == {800: 50.0, 801: 33.5}
+    assert captured["target_blend_shape_channel_overrides"] == {900: 75.0}
+
+
+def test_assemble_endpoint_omits_channel_overrides_when_empty(
+    assemble_client, maya_fbx_ascii: Path,
+):
+    client, captured, _ = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+    })
+    assert r.status_code == 200
+    assert captured.get("blend_shape_channel_overrides") in (None, {})
+    assert captured.get("target_blend_shape_channel_overrides") in (None, {})
+
+
+# --- streaming assemble -----------------------------------------------------
+
+
+@pytest.fixture
+def assemble_stream_client(stress_dir: Path, tmp_path: Path):
+    """Like `assemble_client`, but the fake assemble_fn invokes progress_cb
+    before returning so the streaming endpoint produces non-trivial events.
+    Returns (client, captured, output_dir, scripted_progress) where
+    scripted_progress is the list of (phase, note) the fake will emit."""
+    captured: dict = {}
+    scripted: list[tuple[str, str]] = [
+        ("phase_a", "donor=maya score=1.00"),
+        ("phase_b", "12 drops + 3 renames (cache hit)"),
+        ("phase_c", "merge complete"),
+        ("write", "wrote stub.fbx"),
+    ]
+
+    def fake_assemble(**kwargs):
+        captured.update(kwargs)
+        cb = kwargs.get("progress_cb")
+        if cb is not None:
+            for phase, note in scripted:
+                cb(phase, note)
+        out_fbx = kwargs["out_fbx"]
+        Path(out_fbx).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_fbx).write_bytes(b"FAKE_FBX")
+
+        class _PhaseBStub:
+            class _Decisions:
+                bones = []
+                llm_model_id = "stub"
+            decisions = _Decisions()
+
+        class _Run:
+            output_fbx = out_fbx
+            donor_id = "maya"
+            target_id = kwargs["target_id"]
+            score = 1.0
+            candidates = [("maya", 1.0)]
+            cache_hit = False
+            cache_key = "stubkey"
+            class _EditPlan:
+                drops: list[int] = []
+                renames: dict[int, str] = {}
+                reparents: dict[int, int] = {}
+            edit_plan = _EditPlan()
+            warnings: list = []
+            phase_b = _PhaseBStub()
+            notes: list[str] = ["stub run"]
+        return _Run()
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    app = create_app(
+        data_dir=stress_dir,
+        registry=AvatarRegistry.load_default(),
+        assemble_fn=fake_assemble,
+        output_dir=output_dir,
+    )
+    client = TestClient(app)
+    return client, captured, output_dir, scripted
+
+
+def _read_ndjson_events(response) -> list[dict]:
+    """Decode the NDJSON body of a streaming response into events."""
+    events = []
+    for line in response.iter_lines():
+        if not line:
+            continue
+        # iter_lines yields str in TestClient; be tolerant of bytes too.
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+        events.append(json.loads(line))
+    return events
+
+
+def test_assemble_stream_emits_progress_events_in_order(
+    assemble_stream_client, maya_fbx_ascii: Path,
+):
+    """The endpoint must stream a 'started' event, one 'progress' per
+    callback invocation, and a final 'done' event with the same payload
+    shape as the sync endpoint."""
+    client, _captured, _out, scripted = assemble_stream_client
+    with client.stream("POST", "/api/assemble/stream", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+    }) as response:
+        assert response.status_code == 200
+        # content-type signals NDJSON for the FE to parse line-by-line
+        assert "application/x-ndjson" in response.headers["content-type"]
+        events = _read_ndjson_events(response)
+
+    types = [e["event"] for e in events]
+    assert types[0] == "started"
+    # Final event is done; no heartbeat needed for a fast fake
+    assert types[-1] == "done"
+    # All scripted progress events arrived in order
+    progress_pairs = [(e["phase"], e["note"]) for e in events if e["event"] == "progress"]
+    assert progress_pairs == scripted
+
+    # The done event carries the same body shape as /api/assemble
+    done = events[-1]
+    assert set(done.keys()) >= {"event", "id", "output_fbx", "manifest"}
+    assert done["manifest"]["id"] == done["id"]
+
+
+def test_assemble_stream_emits_error_event_on_failure(
+    stress_dir: Path, tmp_path: Path, maya_fbx_ascii: Path,
+):
+    """When assemble_fn raises, the stream must surface a single 'error'
+    event and close cleanly — not 500. The 2xx status is correct: we
+    successfully started the run; the failure is in-band."""
+    def boom(**kwargs):
+        cb = kwargs.get("progress_cb")
+        if cb is not None:
+            cb("phase_a", "starting")
+        raise RuntimeError("synthetic phase B failure")
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    app = create_app(
+        data_dir=stress_dir,
+        registry=AvatarRegistry.load_default(),
+        assemble_fn=boom,
+        output_dir=output_dir,
+    )
+    client = TestClient(app)
+    with client.stream("POST", "/api/assemble/stream", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+    }) as response:
+        assert response.status_code == 200
+        events = _read_ndjson_events(response)
+    types = [e["event"] for e in events]
+    assert types[0] == "started"
+    assert types[-1] == "error"
+    assert "synthetic phase B failure" in events[-1]["error"]
+
+
+def test_assemble_stream_validates_target_before_streaming(
+    assemble_stream_client, maya_fbx_ascii: Path,
+):
+    """Validation errors (unknown target, missing file) must come back as
+    plain HTTP 4xx — not as in-band error events — so client error handling
+    stays the same as the sync endpoint."""
+    client, _captured, _out, _scripted = assemble_stream_client
+    r = client.post("/api/assemble/stream", json={
+        "target_id": "no-such",
+        "clothing_path": str(maya_fbx_ascii),
+    })
+    assert r.status_code == 400
+
+
+def test_assemble_stream_validates_missing_file_before_streaming(
+    assemble_stream_client, tmp_path: Path,
+):
+    client, _captured, _out, _scripted = assemble_stream_client
+    bogus = tmp_path / "nope.fbx"
+    r = client.post("/api/assemble/stream", json={
+        "target_id": "maya",
+        "clothing_path": str(bogus),
+    })
+    assert r.status_code == 404
+
+
 def test_assemble_endpoint_rejects_unknown_target(
     assemble_client, maya_fbx_ascii: Path,
 ):

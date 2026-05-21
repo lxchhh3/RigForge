@@ -96,6 +96,19 @@ Rail D is the spine. Rail L is a single classification node inside Phase B — n
 
 Output is the merged ASCII. Final `ASCII → binary` produces the deliverable.
 
+## Compose UI (v2 user-facing flow)
+
+The CLI is the v1 entry point and still works (`rigforge assemble`). The v2 face is the compose UI, served by `rigforge serve` + the Vite dev server.
+
+What the modder does:
+1. Pick a target avatar from a dropdown (curated registry).
+2. Inspect lists the target's meshes in a Blender-outliner layout — armature header + parallel mesh names (Body, Hair, Cloth, Shoes, Hat, ...). Uncheck the ones bundled with the avatar that they don't want kept (Maya's default outfit, etc.).
+3. Paste a clothing FBX path → inspect. Repeat for multiple clothings if needed; each gets its own panel.
+4. In each clothing's panel, uncheck meshes they want stripped from that clothing (e.g., a cape they don't want).
+5. Click Assemble. Backend runs the full pipeline (Phase A → B → C) for each clothing against the target, applying the user's mesh drops as pre-filters. Output is a binary FBX + manifest per clothing.
+
+The modder never sees bones. Bone-level decisions still happen — they live in the pipeline and the LLM call — but bones are an internal abstraction. The unit of user agency is the mesh, because Maya's rigging convention puts every bone in every mesh's skin with zero weights, which would make a bone-tree UI lie about what each checkbox actually does.
+
 ## Canonical Schema (v1, lean)
 
 Unity-Humanoid-shaped intermediate, but trimmed for v1. Frozen and versioned (`canonical_schema_version` in cache key).
@@ -170,13 +183,17 @@ D:/2files/models/vrc/CC/Blender-MHWilds/
     │   ├── llm/                         # client (Ollama tag), prompt builder, JSON output parser
     │   ├── pipeline/                    # phase_a / phase_b / phase_c / orchestrator
     │   ├── cache/                       # key, store
+    │   ├── sections/                    # materials/blendshapes merge primitives (v2)
+    │   ├── api/                         # FastAPI bridge for the compose UI (v2)
     │   ├── manifest.py                  # run report emitter
-    │   └── cli.py                       # v1 entry point
+    │   └── cli.py                       # `assemble` / `inspect` / `serve`
+    ├── frontend/                        # Vite + Vue 3 compose UI (v2)
     ├── data/
     │   ├── curated_avatars.json
     │   ├── canonical_schema.json
+    │   ├── ollama.example.json          # template; ollama.json gitignored
     │   └── training/                    # dataset, gitignored beyond pointer
-    ├── training/                        # dataset_build, train, eval scripts
+    ├── training/                        # dataset_build, smoke, eval scripts
     ├── tests/
     └── pyproject.toml
 ```
@@ -189,17 +206,19 @@ D:/2files/models/vrc/CC/Blender-MHWilds/
 | Phase B (LLM canonical mapping + drop) | yes | — |
 | Phase C (text-level armature merge) | yes | — |
 | Bone drop + rename | yes | — |
-| Bone reparent (chain restructure) | no — validator hard-fails the case | yes |
-| Mesh shape fitting | no | yes |
-| Materials, blendshapes | no — pass-through | yes |
-| Non-curated donor rigs | no — hard fail | yes — active-learning loop |
-| Non-T-pose normalization | no | yes |
-| Fingers, twist bones in canonical | no | yes |
-| CLI front door | yes | — |
-| Frontend (Vite + Vue 3) | no | yes |
+| Bone reparent (chain restructure) | no — validator hard-fails the case | yes (landed) |
+| Materials, blendshapes (parsers + dedup primitives + Phase C integration) | no | yes (landed) |
+| Fingers, twist bones in canonical | no | yes (schema v2.1) |
+| CLI front door (`assemble`, `inspect`) | yes | + `serve` |
+| FastAPI bridge | no | yes (landed) |
+| Compose UI: avatar pick → clothing list → mesh-level drops → assemble | no | yes (landed — v2's user-facing deliverable) |
+| User pre-filter (drop unwanted meshes from clothing AND target) | no | yes (landed) |
 | Caching | yes | — |
 | Manifest emission | yes | — |
-| Active-learning correction UI | no | yes |
+| Mesh shape fitting | no | **out of scope** — clothing is assumed pre-fit |
+| Non-T-pose normalization | no | **out of scope** — asset pipeline guarantees T-pose |
+| Non-curated donor rigs / unknown-donor recovery | no — hard fail | **out of scope** — Phase A hard-fails below 0.85 |
+| Active-learning correction UI | no | parked — revisit after v2 ships |
 
 ## Critical Files (will be created)
 

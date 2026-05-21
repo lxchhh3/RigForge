@@ -1,6 +1,6 @@
 # RigForge — Architecture (as built)
 
-Snapshot of the implemented pipeline. PLAN.md is the design doc; this file describes what actually exists in the tree and how the pieces fit together. v1 is the released pipeline; v2 work is landed incrementally and called out inline. Updated 2026-05-21.
+Snapshot of the implemented pipeline. PLAN.md is the design doc; this file describes what actually exists in the tree and how the pieces fit together. v1 was the CLI-only release; v2 added a FastAPI bridge + Vite/Vue compose UI driven entirely off mesh-level user decisions. Updated 2026-05-21.
 
 ## Runtime envs
 
@@ -60,15 +60,20 @@ rigforge/
 ├── ascii_fbx/
 │   ├── convert.py    bin↔ASCII + compare via fbx_env subprocess
 │   ├── lexer.py      byte-level FBX tokenizer (preserves all offsets)
-│   ├── sections.py   3-pass extract → Models + Deformers + Connections → BoneRecord
-│   └── edits.py      TextEdit primitives; drop_bone_edits, rename_bone_edits
+│   ├── sections.py   3-pass extract → Models + Geometries + Skins + Clusters
+│   │                 + materials/blendshapes + cluster_skin/geometry_owner_model
+│   │                 indexes + bone_to_mesh_names() affinity helper
+│   └── edits.py      TextEdit primitives:
+│                       drop_bone_edits, rename_bone_edits, reparent_bone_edits,
+│                       drop_cluster_edits, drop_mesh_edits (v2)
 ├── canonical/
-│   ├── schema.py     CanonicalSchema (22 roles, parents, categories)
-│   ├── decisions.py  Decision / DecisionSet pydantic models
-│   └── validators.py 7 rules + driver
+│   ├── schema.py     CanonicalSchema (v2.1: core/arms/legs + fingers + twist)
+│   ├── decisions.py  Decision / DecisionSet (incl. new_parent_role)
+│   └── validators.py 7 rules + driver (user_dropped exempt from drop_safety)
 ├── avatars/
 │   ├── fingerprint.py  normalize + Jaccard
-│   └── registry.py     load + identify_donor (threshold 0.85)
+│   └── registry.py     load + identify_donor (threshold 0.85);
+│                       CuratedAvatar.load_ascii_view() caches a SectionView
 ├── llm/
 │   ├── client.py     LLMClient Protocol + LLMError
 │   ├── mock.py       MockLLMClient + DispatchMockClient (fixture-driven)
@@ -81,13 +86,61 @@ rigforge/
 │   └── store.py      DecisionCache (filesystem, stores raw LLM output)
 ├── pipeline/
 │   ├── phase_a.py    donor identification
-│   ├── phase_b.py    cache → LLM → validate → (re-prompt) → EditPlan
-│   ├── phase_c.py    apply edits (pass-through for donor==target)
-│   ├── edit_plan.py  EditPlan.from_decisions
+│   ├── phase_b.py    cache → LLM → validate → (re-prompt) → EditPlan;
+│   │                 applies user_drop_bone_ids pre-filter with subtree cascade
+│   ├── phase_c.py    apply edits (pass-through and cross-merge);
+│   │                 applies drop_mesh_ids (both branches) and
+│   │                 target_drop_mesh_ids / target_drop_bone_ids (cross only)
+│   ├── edit_plan.py  EditPlan.from_decisions (drops + renames + reparents)
 │   └── orchestrator.py  assemble() — full bin→ASCII→A→B→C→ASCII→bin
+├── sections/
+│   └── merge.py      merge_materials / merge_blendshapes (donor→target name
+│                     dedup primitives; Phase C cross-merge takes the inverse
+│                     strip-and-repoint path — see "Materials/BlendShapes dedup")
+├── api/
+│   └── server.py     FastAPI app factory; the v2 bridge between Python
+│                     pipeline and the Vite/Vue compose UI. See "API surface".
 ├── manifest.py       run report emitter
-└── cli.py            `rigforge assemble` + `rigforge inspect`
+└── cli.py            `rigforge assemble` + `rigforge inspect` + `rigforge serve`
 ```
+
+## API surface (v2)
+
+`rigforge serve` builds the FastAPI app via `create_app(...)` in `rigforge/api/server.py` and binds it to the Vite dev server's expected origin (CORS allows `localhost:5173` + `127.0.0.1:5173`).
+
+| Method | Path                              | Purpose |
+|--------|-----------------------------------|---------|
+| GET    | `/api/avatars`                    | List curated avatars + their canonical roles |
+| GET    | `/api/avatars/{id}/inspect`       | Parse a curated avatar's ASCII FBX; return bone records (typed: LimbNode / Mesh / Null) for the FE outliner |
+| POST   | `/api/clothings/inspect`          | Same shape as avatar inspect, but for a clothing path. Auto-converts binary FBX through `fbx_env` and caches the ASCII under `data/_inspect_cache/` |
+| POST   | `/api/assemble`                   | Run the full pipeline with optional user pre-filters: `drop_bone_ids` / `target_drop_bone_ids` (advanced) and `drop_mesh_ids` / `target_drop_mesh_ids` (what the FE sends) |
+| GET    | `/api/assemblies`                 | List recent manifests in `data_dir` |
+| GET    | `/api/assemblies/{id}`            | Fetch one manifest by stem |
+
+Inspect returns the same shape for clothings and avatars so the FE renders both through the same `MeshList.vue` component. Bone records include `type_class` (so the FE can filter for `"Mesh"`) and `deforms_meshes` (the bone-affinity helper from sections.py) so power-user tooling can show "this bone drives meshes X, Y, Z."
+
+## Compose flow (v2, what the modder sees)
+
+The FE (`frontend/`) is the user-facing slice. Modder workflow:
+
+```
+Compose.vue
+├── Avatar picker  ─────► GET /api/avatars
+├── TargetPanel    ─────► GET /api/avatars/{id}/inspect
+│   └── MeshList: armature row (no checkbox) + parallel mesh names with checkboxes.
+│       Unchecking strips that mesh from the TARGET before splice
+│       (e.g. Maya ships with Cloth/Shoes/Hat — strip them so new clothing sits clean).
+├── Add clothing path ─► POST /api/clothings/inspect
+│   └── ClothingItem per added clothing
+│       └── MeshList: same outliner shape; unchecking strips that mesh from the clothing.
+└── Assemble button ───► POST /api/assemble
+    └── Sends drop_mesh_ids (per clothing) + target_drop_mesh_ids (shared across batch).
+        Pipeline returns the merged binary FBX path + manifest.
+```
+
+The modder never sees bones. Bone-level drops still exist in the API for power use, but the UI surfaces only mesh model_ids — Maya's rigging convention puts every bone in every mesh's skin, so a bone-level UI lies about what a checkbox actually does. Mesh ids are the honest unit.
+
+`drop_mesh_edits` (in `ascii_fbx/edits.py`) removes a mesh as one consistent chain: Mesh-Model + Geometry + Skin + every Cluster of that Skin + all referencing connections. Bones are left in place (they're shared across meshes; cascading bone cleanup would corrupt siblings).
 
 ## Key invariants
 
@@ -127,8 +180,10 @@ Error → one re-prompt with violation text appended → second failure raises.
 
 | Path | Kind |
 |---|---|
-| `tests/test_*.py` | pytest — 182 tests, ~3m. HTTP mocked, FBX via fixtures. Includes streaming-NDJSON, cross-merge primitives, dedup. |
+| `tests/test_*.py` | pytest — 307 tests, ~9m. HTTP mocked, FBX via fixtures. Covers lexer, sections + affinity, edits (incl. drop_mesh + drop_blend_shape_channel), validators, cache, merge primitives, Phase A/B/C (incl. cross-merge materials/blendshapes dedup and channel drops), the API endpoints (sync + streaming assemble), the LLM client + streaming NDJSON, and end-to-end on real Maya.fbx. |
 | `tests/test_e2e.py` | Full pipeline against `MockLLMClient` → binary compare vs Maya.fbx → must be identical. |
+| `tests/test_api.py` | TestClient against the FastAPI app: avatar/clothing inspect, assemble endpoint, mesh + bone drop forwarding. |
+| `frontend/tests/e2e/*.spec.ts` | Playwright — 15 specs covering compose flow (avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-channel drop UX, live progress + error events, history view). Auto-starts the dev server and mocks the API. |
 | `training/smoke_ollama.py` | Manual. Real Ollama, LLM-only (no Phase C). Spits keep/drop summary + validator output. |
 | `training/smoke_full_pipeline.py` | Manual. Real Ollama, full assemble(), fbx_compare vs Maya.fbx (synth-clothing fixture). |
 | `training/smoke_cross_merge_mock.py` | Manual. Mock LLM, exercises Phase C pass-through on a real clothing (ClassicChic_Moe → Moe). Should round-trip structurally identical. |
@@ -150,14 +205,20 @@ Error → one re-prompt with violation text appended → second failure raises.
 ### v2 (landed)
 
 - **Bone reparenting** — `reparent_bone_edits` in `ascii_fbx/edits.py`; `Decision.new_parent_role` carries the LLM's request; `hierarchy_consistency` validator follows the post-reparent topology; `EditPlan.reparents` resolves `new_parent_role` → bone id; pass-through `_build_passthrough_edits` applies the edits. LLM prompt documents the optional `new_parent_role` field.
-- **Fingers + twist bones in canonical schema** — schema bumped to **v2.0** (cache auto-invalidates because key includes `canonical_schema_version`). 30 finger roles (Thumb/Index/Middle/Ring/Little × 1/2/3 × .L/.R) and 8 twist roles (Upper/LowerArm/Leg.Twist.L/.R), all optional. `finger_count_sanity` validator now checks L/R parity instead of warning on any finger name. `curated_avatars.json` carries finger renames for Maya + Moe.
-- **Materials + blendshapes parsers + merge primitives** — `MaterialRecord` / `BlendShapeRecord` / `BlendShapeChannelRecord` extraction in `sections.py`; `merge_materials` / `merge_blendshapes` with name-keyed dedup in `rigforge/sections/merge.py`. Unit-tested. **Not yet wired into Phase C cross-merge** — see below.
-- **Frontend scaffold** — `frontend/` Vite + Vue 3 + TypeScript + Pinia + Vue Router + Playwright. Landing page + assemblies store skeleton. Not yet wired to the Python backend.
+- **Fingers + twist bones in canonical schema** — schema bumped to **v2.1** (cache auto-invalidates because key includes `canonical_schema_version`). 30 finger roles (Thumb/Index/Middle/Ring/Little × 1/2/3 × .L/.R) and 8 twist roles (Upper/LowerArm/Leg.Twist.L/.R), all optional. `finger_count_sanity` validator now checks L/R parity instead of warning on any finger name. `curated_avatars.json` carries finger renames for Maya + Moe.
+- **Materials + blendshapes parsers + merge primitives** — `MaterialRecord` / `BlendShapeRecord` / `BlendShapeChannelRecord` extraction in `sections.py`; `merge_materials` / `merge_blendshapes` with name-keyed dedup in `rigforge/sections/merge.py`. Unit-tested.
+- **Materials/BlendShapes dedup in Phase C cross-merge** — `_compute_dedup_repoint` in `pipeline/phase_c.py` strips donor materials and BlendShape Deformers + channels whose short name collides with the target, and adds donor→target id mappings to `repoint_table` so `id_offset_edits` rewrites surviving clothing-side connections (e.g. Geometry→Material, BlendShape→Geometry) to the target's existing ids. Symmetric with how kept-bone repointing works.
+- **FastAPI bridge** — `rigforge/api/server.py`, started via `rigforge serve`. Avatars + inspect + assemble + manifest list. CORS for the Vite dev origin. Auto-converts binary FBXs via `fbx_env` for the inspect endpoints, with on-disk caching under `data/_inspect_cache/`.
+- **Compose UI** — `frontend/` Vue 3 / Pinia / Vue Router / Playwright. Modder picks an avatar, adds clothing FBX paths, unchecks meshes in a Blender-outliner-style list (armature header + parallel mesh checkboxes), assembles. Bones are never surfaced.
+- **Mesh-level user pre-filter** — `drop_mesh_edits` primitive cleanly strips Mesh-Model + Geometry + Skin + Clusters as one unit. Endpoint accepts `drop_mesh_ids` + `target_drop_mesh_ids`; Phase C applies them in both pass-through and cross-merge.
+- **Blendshape-channel user pre-filter** — `drop_blend_shape_channel_edits` primitive strips a BlendShapeChannel SubDeformer + connections referencing it (owning BlendShape Deformer preserved — may hold surviving siblings). Inspect surfaces `blend_shape_channels[]`; assemble accepts `drop_blend_shape_channel_ids` + `target_drop_blend_shape_channel_ids`; FE renders a flat per-channel checkbox list with a name filter (channels number in the hundreds on real avatars).
+- **Live assemble progress** — `assemble()` in `pipeline/orchestrator.py` takes an optional `progress_cb(phase, note)` invoked at phase boundaries. New `POST /api/assemble/stream` runs the pipeline on a worker thread and emits NDJSON events (`started` / `progress` / `heartbeat` / `done` / `error`) for the FE to read line-by-line. FE's `AssembleProgressList.vue` shows a 4-phase bar + most recent note per clothing in flight. Sync `POST /api/assemble` kept for CLI/scripted callers.
+- **Bone affinity helper** — `bone_to_mesh_names(view, bone_id)` walks the bone subtree (chain-root case) and the cluster→skin→geometry→model chain, filtering out the zero-weight clusters that Maya's rigging convention inserts. The inspect endpoint returns this per bone so power-user tooling has the right `bone → meshes` map.
+- **`user_drop_bone_ids` pre-filter in Phase B** — forces verdict=drop on user-checked bones and cascades to their subtree; the drop_safety validator skips `drop_category="user_dropped"` so high-weight user drops don't error.
 
 ### v2 (remaining)
 
-- **Materials/blendshapes integration into Phase C cross-merge.** The dedup primitives exist and are unit-tested, but the current wholesale Objects splice doesn't call them. Integration needs id-collision handling (donor material/blendshape ids landing in target's id space after the wholesale splice).
-- **Frontend ↔ backend wiring.** FastAPI bridge — endpoints for listing assembly runs + fetching individual manifests. Browser-side fetch from the Pinia store.
+(none — v2 is complete.)
 
 ### Out of scope — explicitly not problems v2 solves
 

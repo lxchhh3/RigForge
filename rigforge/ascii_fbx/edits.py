@@ -203,6 +203,81 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
     return edits
 
 
+def set_blend_shape_channel_deform_percent_edits(
+    view: SectionView, channel_id: int, percent: float,
+) -> list[TextEdit]:
+    """Edit the `DeformPercent` value of a BlendShapeChannel SubDeformer.
+
+    `percent` is the morph intensity baked into the assembled FBX. Range is
+    nominally 0-100 (matches Maya's slider UI) but the FBX format itself
+    accepts any float. Values outside [0, 100] are passed through verbatim;
+    the caller is responsible for clamping if it cares.
+
+    Returns [] when:
+      - `channel_id` doesn't resolve to a channel in the view (stale FE id)
+      - the channel node has no DeformPercent child (malformed FBX or older
+        exporter that uses a different property name)
+
+    Both failures are silent so a stale or partial id list doesn't break the
+    whole assemble run.
+    """
+    ch = view.blend_shape_channels.get(channel_id)
+    if ch is None:
+        return []
+    source = view.document.source
+    for child in ch.node_ref.children:
+        if child.name != "DeformPercent":
+            continue
+        args_start, args_end = child.args_span
+        region = source[args_start:args_end]
+        # Reuse the positioned-args tokenizer from merge.py so we hit the
+        # numeric token exactly and preserve surrounding whitespace.
+        from .merge import positioned_args
+        for tok in positioned_args(region):
+            if tok.kind == "num":
+                return [TextEdit(
+                    args_start + tok.start,
+                    args_start + tok.end,
+                    _format_percent_value(percent).encode("ascii"),
+                )]
+        return []
+    return []
+
+
+def _format_percent_value(value: float) -> str:
+    """Format a DeformPercent value the way Maya itself does: bare integers
+    when whole, %g for fractions. Avoids '50.0' vs '50' churn that bloats
+    diffs without changing semantics."""
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.6g}"
+
+
+def drop_blend_shape_channel_edits(
+    view: SectionView, channel_id: int
+) -> list[TextEdit]:
+    """Edits required to remove a BlendShapeChannel SubDeformer cleanly:
+       - the channel node itself
+       - every Connection referencing the channel
+
+    The owning BlendShape Deformer is intentionally NOT cascaded — it may
+    still own other channels (FBX docs commonly group all morphs of a mesh
+    under one BlendShape container). An empty BlendShape Deformer is benign
+    in the FBX format; dropping it would risk corrupting other surviving
+    morphs.
+
+    Returns [] if the id isn't a channel in the view, so the API can pass a
+    stale id without breaking the run.
+    """
+    ch = view.blend_shape_channels.get(channel_id)
+    if ch is None:
+        return []
+    source = view.document.source
+    edits: list[TextEdit] = [drop_node_edit(ch.node_ref, source)]
+    edits.extend(_drop_connections_referencing(view, ids={channel_id}))
+    return edits
+
+
 def _drop_connections_referencing(view: SectionView, ids: set[int]) -> list[TextEdit]:
     """Find every `C: "OO", src, dst` leaf in the Connections section that
     touches any id in `ids`, and emit a drop edit for it."""

@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useComposeStore } from '../stores/compose'
 import MeshList from './MeshList.vue'
+import BlendShapeList from './BlendShapeList.vue'
 
 const compose = useComposeStore()
 const { target } = storeToRefs(compose)
@@ -11,6 +12,10 @@ const meshCount = computed(() =>
   target.value.inspect
     ? target.value.inspect.bones.filter((b) => b.type_class === 'Mesh').length
     : 0,
+)
+
+const channelCount = computed(() =>
+  target.value.inspect?.blend_shape_channels?.length ?? 0,
 )
 </script>
 
@@ -30,10 +35,14 @@ const meshCount = computed(() =>
     </div>
     <template v-else-if="target.inspect">
       <div class="meta">
-        <strong>{{ target.avatarId }}</strong> — {{ meshCount }} meshes
+        <strong>{{ target.avatarId }}</strong> — {{ meshCount }} meshes,
+        {{ channelCount }} blendshapes
       </div>
       <div class="tree-wrap">
         <MeshList :source="target" armature-label="Armature" />
+      </div>
+      <div v-if="channelCount > 0" class="bs-wrap">
+        <BlendShapeList :source="target" heading="Blendshapes" />
       </div>
     </template>
   </section>
@@ -83,5 +92,10 @@ const meshCount = computed(() =>
 .tree-wrap {
   max-height: 320px;
   overflow-y: auto;
+}
+.bs-wrap {
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #1a1a1a;
 }
 </style>

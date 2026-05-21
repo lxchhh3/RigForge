@@ -5,6 +5,7 @@ import { useAvatarsStore } from '../stores/avatars'
 import { useComposeStore } from '../stores/compose'
 import ClothingItem from '../components/ClothingItem.vue'
 import TargetPanel from '../components/TargetPanel.vue'
+import AssembleProgressList from '../components/AssembleProgressList.vue'
 
 const avatarsStore = useAvatarsStore()
 const compose = useComposeStore()
@@ -89,6 +90,8 @@ async function runAssemble() {
       </button>
       <span v-if="assembleError" class="hint error">{{ assembleError }}</span>
     </section>
+
+    <AssembleProgressList />
 
     <section v-if="results.length > 0" class="results" data-testid="assemble-results">
       <h2>Results</h2>

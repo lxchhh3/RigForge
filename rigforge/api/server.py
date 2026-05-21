@@ -15,12 +15,16 @@ the user uncheck named secondary chains.
 from __future__ import annotations
 
 import json
+import queue
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from rigforge.ascii_fbx.convert import bin_to_ascii
@@ -48,6 +52,13 @@ class InspectRequest(BaseModel):
     path: str
 
 
+class ChannelOverride(BaseModel):
+    """A user-set DeformPercent for one BlendShapeChannel. The slider in the
+    FE emits a list of these per source (clothing + target)."""
+    channel_id: int
+    deform_percent: float  # nominally 0-100, FBX accepts any float
+
+
 class AssembleRequest(BaseModel):
     target_id: str
     clothing_path: str
@@ -58,6 +69,16 @@ class AssembleRequest(BaseModel):
     # as a unit.
     drop_mesh_ids: list[int] = []
     target_drop_mesh_ids: list[int] = []
+    # BlendShapeChannel-id drops. SubDeformer ids of channels (morphs) that
+    # the modder unchecked. Owning BlendShape Deformer is preserved (it may
+    # carry surviving siblings).
+    drop_blend_shape_channel_ids: list[int] = []
+    target_drop_blend_shape_channel_ids: list[int] = []
+    # DeformPercent overrides — the slider sends one entry per channel the
+    # user moved off its on-disk value. Channels in the corresponding drop
+    # set are ignored (the node is gone before override would apply).
+    blend_shape_channel_overrides: list[ChannelOverride] = []
+    target_blend_shape_channel_overrides: list[ChannelOverride] = []
 
 
 def _build_inspect_response(
@@ -98,11 +119,51 @@ def _build_inspect_response(
         }
         for b in view.bones.values()
     ]
+    # BlendShape channels — flat list sorted by name. The FE renders each as
+    # its own checkbox + DeformPercent slider; owner_name surfaces which
+    # BlendShape Deformer the channel belongs to (informational, not used as
+    # a group key).
+    bs_owners = view.blend_shapes
+    source = view.document.source
+
+    def _read_deform_percent(ch) -> float:
+        # Read the on-disk DeformPercent so the FE slider starts at the
+        # file's actual value (typically 0). Channels without the property
+        # fall through to 0.
+        for child in ch.node_ref.children:
+            if child.name != "DeformPercent":
+                continue
+            args = child.args_bytes(source).strip()
+            if not args:
+                return 0.0
+            try:
+                return float(args.split()[0])
+            except (ValueError, IndexError):
+                return 0.0
+        return 0.0
+
+    channels_out = [
+        {
+            "channel_id": ch.channel_id,
+            "name": ch.name,
+            "owner_id": ch.blend_shape_id,
+            "owner_name": (
+                bs_owners[ch.blend_shape_id].name
+                if ch.blend_shape_id in bs_owners else None
+            ),
+            "deform_percent": _read_deform_percent(ch),
+        }
+        for ch in sorted(
+            view.blend_shape_channels.values(),
+            key=lambda c: (c.name, c.channel_id),
+        )
+    ]
     return {
         "donor_id": donor_id,
         "donor_score": donor_score,
         "total_bones": len(bones_out),
         "bones": bones_out,
+        "blend_shape_channels": channels_out,
     }
 
 
@@ -242,8 +303,14 @@ def create_app(
         # itself.
         return _build_inspect_response(view, donor_id=avatar_id, donor_score=1.0)
 
-    @app.post("/api/assemble")
-    def assemble_clothing(req: AssembleRequest) -> dict:
+    def _validate_assemble_request(req: AssembleRequest) -> tuple[Path, Path, str, dict]:
+        """Shared preflight for both /api/assemble and /api/assemble/stream.
+
+        Returns (clothing_path, out_fbx, stem, kwargs) where kwargs is the
+        unpacked set of drop-id sets ready to pass to assemble_fn.
+        Raises HTTPException on validation failure — the streaming endpoint
+        translates that into a single error event before the stream closes.
+        """
         try:
             registry.get(req.target_id)
         except RegistryError as e:
@@ -268,23 +335,36 @@ def create_app(
         target_drop_mesh: Optional[set[int]] = (
             set(req.target_drop_mesh_ids) if req.target_drop_mesh_ids else None
         )
+        drop_channels: Optional[set[int]] = (
+            set(req.drop_blend_shape_channel_ids)
+            if req.drop_blend_shape_channel_ids else None
+        )
+        target_drop_channels: Optional[set[int]] = (
+            set(req.target_drop_blend_shape_channel_ids)
+            if req.target_drop_blend_shape_channel_ids else None
+        )
+        channel_overrides: Optional[dict[int, float]] = (
+            {o.channel_id: o.deform_percent for o in req.blend_shape_channel_overrides}
+            if req.blend_shape_channel_overrides else None
+        )
+        target_channel_overrides: Optional[dict[int, float]] = (
+            {o.channel_id: o.deform_percent for o in req.target_blend_shape_channel_overrides}
+            if req.target_blend_shape_channel_overrides else None
+        )
 
-        try:
-            run = assemble_fn(
-                clothing_fbx=clothing_path,
-                target_id=req.target_id,
-                out_fbx=out_fbx,
-                registry=registry,
-                schema=schema,
-                llm_client=llm_client,
-                user_drop_bone_ids=drop_ids,
-                target_drop_bone_ids=target_drop_ids,
-                drop_mesh_ids=drop_mesh,
-                target_drop_mesh_ids=target_drop_mesh,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"assemble failed: {e}")
+        kwargs = {
+            "user_drop_bone_ids": drop_ids,
+            "target_drop_bone_ids": target_drop_ids,
+            "drop_mesh_ids": drop_mesh,
+            "target_drop_mesh_ids": target_drop_mesh,
+            "drop_blend_shape_channel_ids": drop_channels,
+            "target_drop_blend_shape_channel_ids": target_drop_channels,
+            "blend_shape_channel_overrides": channel_overrides,
+            "target_blend_shape_channel_overrides": target_channel_overrides,
+        }
+        return clothing_path, out_fbx, stem, kwargs
 
+    def _write_manifest_and_response(run, stem: str, out_fbx: Path) -> dict:
         manifest = build_manifest(run)
         manifest_path = data_dir / f"{stem}.manifest.json"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,5 +375,105 @@ def create_app(
             "output_fbx": str(out_fbx),
             "manifest": manifest,
         }
+
+    @app.post("/api/assemble")
+    def assemble_clothing(req: AssembleRequest) -> dict:
+        clothing_path, out_fbx, stem, kwargs = _validate_assemble_request(req)
+        try:
+            run = assemble_fn(
+                clothing_fbx=clothing_path,
+                target_id=req.target_id,
+                out_fbx=out_fbx,
+                registry=registry,
+                schema=schema,
+                llm_client=llm_client,
+                **kwargs,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"assemble failed: {e}")
+        return _write_manifest_and_response(run, stem, out_fbx)
+
+    @app.post("/api/assemble/stream")
+    def assemble_clothing_stream(req: AssembleRequest):
+        """Streaming variant of /api/assemble. Emits one JSON object per line:
+
+          {"event": "progress", "phase": "phase_a|phase_b|phase_c|write", "note": "..."}
+          {"event": "done", "id": "...", "output_fbx": "...", "manifest": {...}}
+          {"event": "error", "error": "..."}
+
+        Pre-flight validation errors still raise HTTPException so the client
+        gets a normal 4xx with a Content-Type of application/json — only the
+        2xx "we started running it" case streams.
+        """
+        clothing_path, out_fbx, stem, kwargs = _validate_assemble_request(req)
+
+        events: queue.Queue = queue.Queue()
+        # Sentinel to terminate the generator.
+        _DONE = object()
+
+        def on_progress(phase: str, note: str) -> None:
+            events.put({"event": "progress", "phase": phase, "note": note})
+
+        def worker() -> None:
+            try:
+                run = assemble_fn(
+                    clothing_fbx=clothing_path,
+                    target_id=req.target_id,
+                    out_fbx=out_fbx,
+                    registry=registry,
+                    schema=schema,
+                    llm_client=llm_client,
+                    progress_cb=on_progress,
+                    **kwargs,
+                )
+                body = _write_manifest_and_response(run, stem, out_fbx)
+                events.put({"event": "done", **body})
+            except Exception as e:
+                events.put({"event": "error", "error": f"{type(e).__name__}: {e}"})
+            finally:
+                events.put(_DONE)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        def gen():
+            # Initial "started" event so the FE can show "running…" immediately;
+            # the worker thread might be slow to emit its first real progress
+            # update (Phase A reads the FBX, converts binary→ASCII).
+            yield json.dumps({"event": "started", "stem": stem}) + "\n"
+            # Heartbeat interval: long Phase B (Ollama) runs can be silent for
+            # minutes. Re-yielding the latest note every few seconds keeps the
+            # connection alive through proxies + reassures the FE.
+            last_progress: Optional[dict] = None
+            last_heartbeat = time.monotonic()
+            HEARTBEAT_S = 5.0
+            while True:
+                try:
+                    item = events.get(timeout=1.0)
+                except queue.Empty:
+                    now = time.monotonic()
+                    if last_progress and now - last_heartbeat >= HEARTBEAT_S:
+                        yield json.dumps({"event": "heartbeat", **last_progress}) + "\n"
+                        last_heartbeat = now
+                    continue
+                if item is _DONE:
+                    break
+                if item.get("event") == "progress":
+                    last_progress = item
+                    last_heartbeat = time.monotonic()
+                yield json.dumps(item) + "\n"
+
+        return StreamingResponse(
+            gen(),
+            media_type="application/x-ndjson",
+            headers={
+                # CORS: StreamingResponse doesn't auto-inherit the middleware's
+                # ACAO when the response is built lazily; the middleware adds
+                # headers post-hoc so this is fine — but X-Accel-Buffering off
+                # so nginx (if any) doesn't hold the whole stream.
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+            },
+        )
 
     return app

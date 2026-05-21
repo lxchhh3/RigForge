@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from rigforge.ascii_fbx.convert import ascii_to_bin
 from rigforge.avatars.registry import AvatarRegistry
@@ -45,6 +45,15 @@ class PipelineRun:
     notes: list[str] = field(default_factory=list)
 
 
+ProgressCallback = Callable[[str, str], None]
+"""(phase, note) — phase is one of 'phase_a'|'phase_b'|'phase_c'|'write';
+note is a one-line human-readable description of the just-completed step.
+
+The callback is invoked at phase boundaries from the orchestrator. It runs
+inline on the worker thread; the API layer wraps it to push events onto a
+streaming queue."""
+
+
 def assemble(
     *,
     clothing_fbx: Path,
@@ -59,6 +68,11 @@ def assemble(
     target_drop_bone_ids: Optional[set[int]] = None,
     drop_mesh_ids: Optional[set[int]] = None,
     target_drop_mesh_ids: Optional[set[int]] = None,
+    drop_blend_shape_channel_ids: Optional[set[int]] = None,
+    target_drop_blend_shape_channel_ids: Optional[set[int]] = None,
+    blend_shape_channel_overrides: Optional[dict[int, float]] = None,
+    target_blend_shape_channel_overrides: Optional[dict[int, float]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
 ) -> PipelineRun:
     """Run the full assembly pipeline and write the deliverable binary FBX.
 
@@ -66,15 +80,31 @@ def assemble(
       - Phase A donor identification below threshold
       - Phase B validator errors after re-prompt
       - Phase C unsupported merge case (cross-avatar in v1)
+
+    `progress_cb` is invoked at each phase boundary so the API layer can
+    stream live status to the FE. The callback signature is
+    `progress_cb(phase, note)`; see [[ProgressCallback]].
     """
+    def _emit(phase: str, note: str) -> None:
+        if progress_cb is not None:
+            try:
+                progress_cb(phase, note)
+            except Exception:
+                # A broken callback must never crash the pipeline. The FE-side
+                # consumer is best-effort; pipeline correctness comes first.
+                pass
+
     clothing_fbx = Path(clothing_fbx).resolve()
     out_fbx = Path(out_fbx).resolve()
     work_dir = (Path(work_dir).resolve() if work_dir else out_fbx.parent / "_rigforge_work")
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    _emit("phase_a", f"identifying donor for {clothing_fbx.name}")
     # --- Phase A
     a = run_phase_a(clothing_fbx, registry, work_dir=work_dir)
+    _emit("phase_a", f"donor={a.donor_id} score={a.score:.2f}")
 
+    _emit("phase_b", f"classifying {len(a.view.limb_bones())} bones (LLM may take minutes)")
     # --- Phase B
     b = run_phase_b(
         view=a.view,
@@ -86,7 +116,13 @@ def assemble(
         cache=cache,
         user_drop_bone_ids=user_drop_bone_ids,
     )
+    _emit(
+        "phase_b",
+        f"{len(b.edit_plan.drops)} drops + {len(b.edit_plan.renames)} renames "
+        f"({'cache hit' if b.cache_hit else 'fresh LLM run'})",
+    )
 
+    _emit("phase_c", "applying edits + merging armature")
     # --- Phase C
     clothing_ascii = a.ascii_path.read_bytes()
     c = run_phase_c(
@@ -100,12 +136,19 @@ def assemble(
         target_drop_bone_ids=target_drop_bone_ids,
         target_drop_mesh_ids=target_drop_mesh_ids,
         drop_mesh_ids=drop_mesh_ids,
+        drop_blend_shape_channel_ids=drop_blend_shape_channel_ids,
+        target_drop_blend_shape_channel_ids=target_drop_blend_shape_channel_ids,
+        blend_shape_channel_overrides=blend_shape_channel_overrides,
+        target_blend_shape_channel_overrides=target_blend_shape_channel_overrides,
     )
+    _emit("phase_c", "merge complete")
 
+    _emit("write", "converting ASCII → binary FBX")
     # --- Write merged ASCII + convert to binary
     merged_ascii_path = work_dir / (out_fbx.stem + "_merged_ascii.fbx")
     merged_ascii_path.write_bytes(c.merged_ascii)
     ascii_to_bin(merged_ascii_path, out_fbx)
+    _emit("write", f"wrote {out_fbx.name}")
 
     return PipelineRun(
         output_fbx=out_fbx,

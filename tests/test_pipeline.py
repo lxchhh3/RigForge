@@ -558,3 +558,351 @@ def test_phase_c_passthrough_ignores_target_drop_bone_ids(
     )
     # Output must re-parse cleanly
     extract(parse(result.merged_ascii))
+
+
+def test_phase_c_passthrough_drops_clothing_blend_shape_channels(
+    maya_fbx_ascii: Path, registry,
+):
+    """In pass-through mode, drop_blend_shape_channel_ids strips clothing-side
+    morph channels — same UX as drop_mesh_ids but for blendshapes."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    # Pick a real channel from the clothing
+    ch = next(iter(view.blend_shape_channels.values()))
+    plan = EditPlan()
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="maya",
+        registry=registry,
+        edit_plan=plan,
+        drop_blend_shape_channel_ids={ch.channel_id},
+    )
+    # The channel's id must no longer be the channel_id of any record in the
+    # merged view (the node is gone). Use id-equality rather than name because
+    # FBX permits same-named channels across distinct deformers.
+    merged_view = extract(parse(result.merged_ascii))
+    assert ch.channel_id not in merged_view.blend_shape_channels
+    assert any("drop_blend_shape_channels" in n for n in result.notes)
+
+
+def test_phase_c_passthrough_applies_clothing_deform_percent_override(
+    maya_fbx_ascii: Path, registry,
+):
+    """A DeformPercent override on a clothing channel must rewrite the
+    on-disk value (typically 0) to the requested float. Pass-through path."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    ch = next(iter(view.blend_shape_channels.values()))
+    plan = EditPlan()
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="maya",
+        registry=registry,
+        edit_plan=plan,
+        blend_shape_channel_overrides={ch.channel_id: 42.5},
+    )
+    # The new DeformPercent reads as 42.5 in the output ASCII
+    out_view = extract(parse(result.merged_ascii))
+    out_ch = out_view.blend_shape_channels[ch.channel_id]
+    for child in out_ch.node_ref.children:
+        if child.name == "DeformPercent":
+            args = child.args_bytes(result.merged_ascii).strip()
+            assert args == b"42.5", f"expected b'42.5', got {args!r}"
+            break
+    else:
+        raise AssertionError("DeformPercent missing on output channel")
+    assert any("override" in n and "DeformPercent" in n for n in result.notes)
+
+
+def test_phase_c_passthrough_override_skipped_when_channel_dropped(
+    maya_fbx_ascii: Path, registry,
+):
+    """If the same channel id is in both drop set and override map, the drop
+    wins (the node vanishes) and the override is silently skipped — no
+    edit-overlap error from apply_edits."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    ch = next(iter(view.blend_shape_channels.values()))
+    plan = EditPlan()
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="maya",
+        registry=registry,
+        edit_plan=plan,
+        drop_blend_shape_channel_ids={ch.channel_id},
+        blend_shape_channel_overrides={ch.channel_id: 80},
+    )
+    out_view = extract(parse(result.merged_ascii))
+    assert ch.channel_id not in out_view.blend_shape_channels
+
+
+def test_phase_c_cross_avatar_applies_target_deform_percent_override(
+    maya_fbx_ascii: Path, registry,
+):
+    """target_blend_shape_channel_overrides must rewrite DeformPercent on
+    target channels BEFORE the splice, so the assembled FBX ships with the
+    modder's baked-in expression values."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+
+    moe = registry.get("moe")
+    moe_view = moe.load_ascii_view()
+    target_ch = next(iter(moe_view.blend_shape_channels.values()))
+
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+    bones = []
+    for b in view.limb_bones():
+        role = display_to_role.get(b.name)
+        if role is not None:
+            bones.append(Decision(model_id=b.model_id, role=role, verdict="keep"))
+        else:
+            bones.append(Decision(model_id=b.model_id,
+                                   role=f"Secondary.{b.name}", verdict="keep"))
+    decisions = DecisionSet(bones=bones, llm_model_id="test-target-channel-override")
+
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="moe",
+        registry=registry,
+        edit_plan=EditPlan(),
+        decisions=decisions,
+        target_blend_shape_channel_overrides={target_ch.channel_id: 60},
+    )
+    out_view = extract(parse(result.merged_ascii))
+    out_ch = out_view.blend_shape_channels[target_ch.channel_id]
+    for child in out_ch.node_ref.children:
+        if child.name == "DeformPercent":
+            args = child.args_bytes(result.merged_ascii).strip()
+            assert args == b"60", f"expected b'60', got {args!r}"
+            break
+    else:
+        raise AssertionError("DeformPercent missing on target channel after merge")
+
+
+def test_phase_c_cross_avatar_drops_target_blend_shape_channels(
+    maya_fbx_ascii: Path, registry,
+):
+    """Cross-merge must strip target-side morph channels when
+    target_drop_blend_shape_channel_ids is set, so the modder can cull morphs
+    they don't want shipped on the avatar."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+
+    moe = registry.get("moe")
+    moe_view = moe.load_ascii_view()
+    target_ch = next(iter(moe_view.blend_shape_channels.values()))
+
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+    bones = []
+    for b in view.limb_bones():
+        role = display_to_role.get(b.name)
+        if role is not None:
+            bones.append(Decision(model_id=b.model_id, role=role, verdict="keep"))
+        else:
+            bones.append(Decision(model_id=b.model_id,
+                                   role=f"Secondary.{b.name}", verdict="keep"))
+    decisions = DecisionSet(bones=bones, llm_model_id="test-target-channel-drop")
+
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="moe",
+        registry=registry,
+        edit_plan=EditPlan(),
+        decisions=decisions,
+        target_drop_blend_shape_channel_ids={target_ch.channel_id},
+    )
+    merged_view = extract(parse(result.merged_ascii))
+    assert target_ch.channel_id not in merged_view.blend_shape_channels, (
+        "target_drop_blend_shape_channel_ids should have removed the target channel"
+    )
+
+
+def test_phase_c_cross_avatar_dedups_materials_by_name(
+    maya_fbx_ascii: Path, registry,
+):
+    """Maya and Moe both ship with materials named Body/Cloth/Hair/etc.
+    After cross-merge the result must have exactly ONE of each — the target's.
+    Without dedup, the wholesale Objects splice double-inserts every donor
+    material, producing duplicate Material::Cloth nodes.
+    """
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+
+    moe = registry.get("moe")
+    moe_view = moe.load_ascii_view()
+    shared = (
+        {m.name for m in view.materials.values()}
+        & {m.name for m in moe_view.materials.values()}
+    )
+    assert shared, "fixture broken: expected at least one shared material name"
+
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+    bones = []
+    for b in view.limb_bones():
+        role = display_to_role.get(b.name)
+        if role is not None:
+            bones.append(Decision(model_id=b.model_id, role=role, verdict="keep"))
+        else:
+            bones.append(Decision(model_id=b.model_id,
+                                   role=f"Secondary.{b.name}", verdict="keep"))
+    decisions = DecisionSet(bones=bones, llm_model_id="test-dedup-materials")
+
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="moe",
+        registry=registry,
+        edit_plan=EditPlan(),
+        decisions=decisions,
+    )
+    merged = result.merged_ascii
+    # Output re-parses
+    merged_view = extract(parse(merged))
+
+    # Every shared-name material appears exactly once
+    for name in shared:
+        needle = f'"Material::{name}"'.encode("utf-8")
+        count = merged.count(needle)
+        assert count == 1, (
+            f"expected 1 Material::{name} after dedup, got {count}"
+        )
+
+    # Note should record the dedup
+    assert any("dedup: dropped" in n and "materials" in n for n in result.notes), (
+        f"expected a dedup note, got: {result.notes}"
+    )
+
+    # The dedup primitive in the merged view should still hold target ids
+    merged_mat_names = {m.name for m in merged_view.materials.values()}
+    for name in shared:
+        assert name in merged_mat_names
+
+
+def test_phase_c_cross_avatar_dedups_blendshape_channels_by_name(
+    maya_fbx_ascii: Path, registry,
+):
+    """Same dedup logic for BlendShapeChannel SubDeformers. Maya + Moe share
+    ~100 channels (e.g. '평면.001'); each must survive once."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+
+    moe = registry.get("moe")
+    moe_view = moe.load_ascii_view()
+    shared = (
+        {c.name for c in view.blend_shape_channels.values()}
+        & {c.name for c in moe_view.blend_shape_channels.values()}
+    )
+    assert shared, "fixture broken: expected shared blendshape channel names"
+
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+    bones = []
+    for b in view.limb_bones():
+        role = display_to_role.get(b.name)
+        if role is not None:
+            bones.append(Decision(model_id=b.model_id, role=role, verdict="keep"))
+        else:
+            bones.append(Decision(model_id=b.model_id,
+                                   role=f"Secondary.{b.name}", verdict="keep"))
+    decisions = DecisionSet(bones=bones, llm_model_id="test-dedup-channels")
+
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="moe",
+        registry=registry,
+        edit_plan=EditPlan(),
+        decisions=decisions,
+    )
+    merged = result.merged_ascii
+    target_ascii = moe.load_ascii_bytes()
+    extract(parse(merged))  # structural sanity
+
+    # Spot-check: every shared channel's count in the merged ASCII must match
+    # the target's pre-merge count (donor copies dropped). FBX allows multiple
+    # channels with the same short name across different BlendShape Deformers,
+    # so we compare counts rather than asserting exactly 1.
+    sample = sorted(shared)[:10]
+    for name in sample:
+        needle = f'"SubDeformer::{name}"'.encode("utf-8")
+        merged_count = merged.count(needle)
+        target_count = target_ascii.count(needle)
+        assert merged_count == target_count, (
+            f"expected {target_count} SubDeformer::{name} after dedup, "
+            f"got {merged_count}"
+        )
+
+    assert any("dedup: dropped" in n and "channels" in n for n in result.notes), (
+        f"expected a channel dedup note, got: {result.notes}"
+    )
+
+
+def test_phase_c_cross_avatar_dedup_repoints_connections_to_target(
+    maya_fbx_ascii: Path, registry,
+):
+    """When a donor material is dropped because it collides by name with a
+    target material, clothing-side connections that referenced the donor
+    material must be redirected to the target material's id by id_offset's
+    repoint table — otherwise the spliced Geometry-Material connection points
+    at a non-existent id.
+
+    Sanity check: pick a shared material, find a clothing-side connection that
+    references it, and assert the merged ASCII contains the target's id for
+    that material (not the offset-shifted donor id).
+    """
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+
+    moe = registry.get("moe")
+    moe_view = moe.load_ascii_view()
+
+    # Pick a shared material that has at least one connection on the donor side.
+    moe_by_name = {m.name: mid for mid, m in moe_view.materials.items()}
+    donor_mat = None
+    for mid, mat in view.materials.items():
+        if mat.name in moe_by_name:
+            donor_mat = (mid, mat.name, moe_by_name[mat.name])
+            break
+    assert donor_mat is not None, "fixture broken: need a shared material"
+    donor_mid, mat_name, target_mid = donor_mat
+
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+    bones = []
+    for b in view.limb_bones():
+        role = display_to_role.get(b.name)
+        if role is not None:
+            bones.append(Decision(model_id=b.model_id, role=role, verdict="keep"))
+        else:
+            bones.append(Decision(model_id=b.model_id,
+                                   role=f"Secondary.{b.name}", verdict="keep"))
+    decisions = DecisionSet(bones=bones, llm_model_id="test-dedup-repoint")
+
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="moe",
+        registry=registry,
+        edit_plan=EditPlan(),
+        decisions=decisions,
+    )
+    merged_view = extract(parse(result.merged_ascii))
+
+    # The target material's id must still be the one in merged_view; the donor
+    # id must be absent (dropped and repointed).
+    merged_mat_ids_by_name = {m.name: mid for mid, m in merged_view.materials.items()}
+    assert merged_mat_ids_by_name[mat_name] == target_mid, (
+        f"expected target material {mat_name} to keep id {target_mid}, "
+        f"got {merged_mat_ids_by_name[mat_name]}"
+    )

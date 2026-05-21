@@ -9,11 +9,13 @@ from rigforge.ascii_fbx.edits import (
     EditError,
     TextEdit,
     apply_edits,
+    drop_blend_shape_channel_edits,
     drop_bone_edits,
     drop_cluster_edits,
     drop_mesh_edits,
     drop_node_edit,
     rename_bone_edits,
+    set_blend_shape_channel_deform_percent_edits,
 )
 from rigforge.ascii_fbx.lexer import parse
 from rigforge.ascii_fbx.sections import extract
@@ -257,6 +259,181 @@ def test_drop_mesh_on_bone_model_returns_empty():
     assert drop_mesh_edits(view, 100) == []
     # And the resulting source is unchanged
     assert apply_edits(MINI_MESH_FBX, drop_mesh_edits(view, 100)) == MINI_MESH_FBX
+
+
+# --- drop blendshape channel edits ------------------------------------------
+
+
+# Minimal fixture: one Geometry with two BlendShape Deformers, each owning
+# one channel; one channel ("Wink") is shared in name but distinct id from
+# the other. Tests below drop one channel and assert the second + owners
+# are untouched.
+MINI_BLENDSHAPE_FBX = b"""\
+; FBX 7.4.0 project file
+Objects:  {
+\tGeometry: 300, "Geometry::Body", "Mesh" {
+\t}
+\tDeformer: 700, "Deformer::Face", "BlendShape" {
+\t\tVersion: 100
+\t}
+\tDeformer: 701, "Deformer::Brow", "BlendShape" {
+\t\tVersion: 100
+\t}
+\tDeformer: 800, "SubDeformer::Smile", "BlendShapeChannel" {
+\t\tVersion: 100
+\t\tDeformPercent: 0
+\t}
+\tDeformer: 801, "SubDeformer::Wink", "BlendShapeChannel" {
+\t\tVersion: 100
+\t\tDeformPercent: 0
+\t}
+\tDeformer: 802, "SubDeformer::BrowUp", "BlendShapeChannel" {
+\t\tVersion: 100
+\t\tDeformPercent: 0
+\t}
+}
+Connections:  {
+\t;Face -> Geometry
+\tC: "OO",700,300
+\t;Brow -> Geometry
+\tC: "OO",701,300
+\t;Smile -> Face
+\tC: "OO",800,700
+\t;Wink -> Face
+\tC: "OO",801,700
+\t;BrowUp -> Brow
+\tC: "OO",802,701
+}
+"""
+
+
+def test_drop_blend_shape_channel_removes_node_and_connections():
+    """Dropping one BlendShapeChannel must remove its node + the connection
+    that links it to its owning BlendShape Deformer, while leaving the owner
+    and sibling channels intact."""
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    smile_id = 800
+
+    edits = drop_blend_shape_channel_edits(view, smile_id)
+    out = apply_edits(MINI_BLENDSHAPE_FBX, edits)
+
+    # Smile gone
+    assert b'"SubDeformer::Smile"' not in out
+    # Owner + siblings intact
+    assert b'"Deformer::Face"' in out
+    assert b'"SubDeformer::Wink"' in out
+    assert b'"SubDeformer::BrowUp"' in out
+
+    # No connection still references the dropped channel id
+    out_doc = parse(out)
+    conn = out_doc.root("Connections")
+    from rigforge.ascii_fbx.sections import parse_args
+    for c in conn.children:
+        if c.name != "C":
+            continue
+        args = parse_args(c.args_bytes(out))
+        if len(args) < 3:
+            continue
+        if args[1][0] == "num" and args[2][0] == "num":
+            assert int(args[1][1]) != smile_id
+            assert int(args[2][1]) != smile_id
+
+
+def test_drop_blend_shape_channel_does_not_cascade_to_owner():
+    """When a channel is dropped, the BlendShape Deformer that owns it stays
+    even if it had only one child. Other channels under the same owner (or a
+    sibling owner) might need it; an empty BlendShape is benign in FBX."""
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    edits = drop_blend_shape_channel_edits(view, 802)  # only child of "Brow"
+    out = apply_edits(MINI_BLENDSHAPE_FBX, edits)
+    assert b'"SubDeformer::BrowUp"' not in out
+    assert b'"Deformer::Brow"' in out, (
+        "owning BlendShape must survive even if all its channels are dropped"
+    )
+
+
+def test_drop_blend_shape_channel_unknown_id_returns_empty():
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    assert drop_blend_shape_channel_edits(view, 9999) == []
+
+
+def test_drop_blend_shape_channel_on_non_channel_id_returns_empty():
+    """Passing a BlendShape Deformer id (not a channel) is a no-op — the
+    primitive is strictly per-channel."""
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    assert drop_blend_shape_channel_edits(view, 700) == []  # "Face" owner
+
+
+# --- DeformPercent override -------------------------------------------------
+
+
+def test_set_deform_percent_rewrites_numeric_value():
+    """Setting the channel's DeformPercent must rewrite ONLY the numeric
+    token — surrounding whitespace, the property name, and sibling lines
+    stay byte-identical."""
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    edits = set_blend_shape_channel_deform_percent_edits(view, 800, 75)
+    assert edits, "expected one edit for the Smile channel"
+    out = apply_edits(MINI_BLENDSHAPE_FBX, edits)
+
+    # Smile's DeformPercent is now 75; the other channels' lines untouched.
+    out_doc = parse(out)
+    out_view = extract(out_doc)
+    smile = out_view.blend_shape_channels[800]
+    # Re-locate the DeformPercent child and read the new value
+    for child in smile.node_ref.children:
+        if child.name == "DeformPercent":
+            args = child.args_bytes(out_doc.source).strip()
+            assert args == b"75", f"expected b'75', got {args!r}"
+            break
+    else:
+        raise AssertionError("DeformPercent child missing on Smile after edit")
+
+    # Sibling channels' DeformPercent untouched (still 0)
+    for cid in (801, 802):
+        ch = out_view.blend_shape_channels[cid]
+        for child in ch.node_ref.children:
+            if child.name == "DeformPercent":
+                assert child.args_bytes(out_doc.source).strip() == b"0"
+
+
+def test_set_deform_percent_formats_int_when_whole():
+    """A whole-number percent should serialize as a bare int ('50'), matching
+    Maya's own ASCII export style — keeps diffs clean."""
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    edits = set_blend_shape_channel_deform_percent_edits(view, 800, 50.0)
+    out = apply_edits(MINI_BLENDSHAPE_FBX, edits)
+    # The replacement string itself
+    assert edits[0].replacement == b"50"
+    assert b"DeformPercent: 50\n" in out
+
+
+def test_set_deform_percent_formats_fractional_via_g():
+    """A fractional percent uses %g (six significant figures), no trailing
+    zeros. 33.5 → '33.5', not '33.500000'."""
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    edits = set_blend_shape_channel_deform_percent_edits(view, 800, 33.5)
+    assert edits[0].replacement == b"33.5"
+
+
+def test_set_deform_percent_unknown_channel_returns_empty():
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    assert set_blend_shape_channel_deform_percent_edits(view, 9999, 50) == []
+
+
+def test_set_deform_percent_on_non_channel_id_returns_empty():
+    """Passing a BlendShape Deformer id is a no-op — strictly per-channel."""
+    doc = parse(MINI_BLENDSHAPE_FBX)
+    view = extract(doc)
+    assert set_blend_shape_channel_deform_percent_edits(view, 700, 50) == []
 
 
 # --- rename edits ------------------------------------------------------------
