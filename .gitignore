@@ -18,6 +18,10 @@ venv/
 *.pem
 credentials*
 secrets*
+# Files with API_KEY in the name are always sensitive (e.g. user's
+# "API_KEY_MAKE_VERY_SURE_NO_LEAKAGE.md" workflow file)
+*API_KEY*
+*api_key*
 
 # RigForge-specific
 cache/

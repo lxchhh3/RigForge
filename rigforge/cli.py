@@ -22,6 +22,7 @@ from typing import Optional
 from rigforge.avatars.registry import AvatarRegistry
 from rigforge.cache.store import DecisionCache
 from rigforge.canonical.schema import CanonicalSchema
+from rigforge.llm.anthropic import AnthropicLLMClient
 from rigforge.llm.client import LLMClient
 from rigforge.llm.mock import MockLLMClient
 from rigforge.llm.ollama import OllamaLLMClient
@@ -35,9 +36,14 @@ def _build_llm_client(args) -> LLMClient:
     if args.llm_ollama is not None:
         config_path = None if args.llm_ollama == "<default>" else Path(args.llm_ollama)
         return OllamaLLMClient.from_config_file(config_path)
+    if getattr(args, "llm_anthropic", None) is not None:
+        key_path = None if args.llm_anthropic == "<default>" else Path(args.llm_anthropic)
+        return AnthropicLLMClient.from_key_file(key_path)
     raise SystemExit(
-        "error: provide either --llm-mock <decisions.json> or --llm-ollama "
-        "[config.json]. The Ollama config lives in data/ollama.json by default."
+        "error: provide one of --llm-mock <decisions.json>, --llm-ollama "
+        "[config.json], or --llm-anthropic [keyfile.md]. Ollama config "
+        "lives in data/ollama.json; Anthropic key in "
+        "API_KEY_MAKE_VERY_SURE_NO_LEAKAGE.md by default."
     )
 
 
@@ -110,7 +116,11 @@ def cmd_serve(args) -> int:
     # LLM client + cache wiring — same options the assemble subcommand
     # accepts, so the FE-triggered assemble runs against the same config.
     llm_client = None
-    if args.llm_mock or args.llm_ollama is not None:
+    if (
+        args.llm_mock
+        or args.llm_ollama is not None
+        or getattr(args, "llm_anthropic", None) is not None
+    ):
         llm_client = _build_llm_client(args)
     cache = DecisionCache(root=Path(args.cache_dir)) if args.cache_dir else None
     schema = CanonicalSchema.load(Path(args.schema)) if args.schema \
@@ -125,7 +135,8 @@ def cmd_serve(args) -> int:
         # The assemble endpoint will 500 with a clear message if the user
         # tries to hit it without one.
         print("warn: no LLM client configured; assemble endpoint will fail. "
-              "Pass --llm-ollama [CONFIG] or --llm-mock FIXTURE to enable it.")
+              "Pass --llm-ollama [CONFIG], --llm-anthropic [KEYFILE], or "
+              "--llm-mock FIXTURE to enable it.")
 
     # Wrap assemble so the API can pass a single fn into create_app and we
     # close over cache from here (orchestrator.assemble takes cache as a kwarg).
@@ -164,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use OllamaLLMClient. Optional path to ollama config JSON; "
              "defaults to data/ollama.json.",
     )
+    llm_group.add_argument(
+        "--llm-anthropic", nargs="?", const="<default>", metavar="KEYFILE",
+        help="Use AnthropicLLMClient (Messages API). Optional path to a "
+             "file containing the API key; defaults to "
+             "API_KEY_MAKE_VERY_SURE_NO_LEAKAGE.md.",
+    )
     a.set_defaults(func=cmd_assemble)
 
     i = sub.add_parser("inspect", help="Phase A donor diagnostics only (no FBX output)")
@@ -189,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-ollama", nargs="?", const="<default>", metavar="CONFIG",
         help="Use OllamaLLMClient. Optional path to ollama config JSON; "
              "defaults to data/ollama.json.",
+    )
+    s_llm.add_argument(
+        "--llm-anthropic", nargs="?", const="<default>", metavar="KEYFILE",
+        help="Use AnthropicLLMClient (Messages API). Optional path to the "
+             "API key file; defaults to API_KEY_MAKE_VERY_SURE_NO_LEAKAGE.md.",
     )
     s.set_defaults(func=cmd_serve)
 
