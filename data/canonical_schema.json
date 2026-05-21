@@ -1,0 +1,94 @@
+{
+  "version": "2.1",
+  "description": "RigForge v2 canonical bone schema. v2.0 promotes fingers and twist bones to canonical roles (both optional). v2.1 adds an 'Accessory' secondary pattern so the LLM has a real role for kept structural-only parent bones (ribbon roots, jacket roots, decorative chain anchors) whose subtree carries skin weights even though the bone itself doesn't fit a canonical role. Bumping this version invalidates all cached LLM decisions.",
+  "roles": {
+    "Hips":       {"parent": null,        "category": "core"},
+    "Spine":      {"parent": "Hips",      "category": "core"},
+    "Chest":      {"parent": "Spine",     "category": "core"},
+    "UpperChest": {"parent": "Chest",     "category": "core", "optional": true},
+    "Neck":       {"parent": "Chest",     "category": "core"},
+    "Head":       {"parent": "Neck",      "category": "core"},
+
+    "Shoulder.L":  {"parent": "Chest",      "category": "arm"},
+    "Shoulder.R":  {"parent": "Chest",      "category": "arm"},
+    "UpperArm.L":  {"parent": "Shoulder.L", "category": "arm"},
+    "UpperArm.R":  {"parent": "Shoulder.R", "category": "arm"},
+    "LowerArm.L":  {"parent": "UpperArm.L", "category": "arm"},
+    "LowerArm.R":  {"parent": "UpperArm.R", "category": "arm"},
+    "Hand.L":      {"parent": "LowerArm.L", "category": "arm"},
+    "Hand.R":      {"parent": "LowerArm.R", "category": "arm"},
+
+    "UpperLeg.L":  {"parent": "Hips",       "category": "leg"},
+    "UpperLeg.R":  {"parent": "Hips",       "category": "leg"},
+    "LowerLeg.L":  {"parent": "UpperLeg.L", "category": "leg"},
+    "LowerLeg.R":  {"parent": "UpperLeg.R", "category": "leg"},
+    "Foot.L":      {"parent": "LowerLeg.L", "category": "leg"},
+    "Foot.R":      {"parent": "LowerLeg.R", "category": "leg"},
+    "Toes.L":      {"parent": "Foot.L",     "category": "leg"},
+    "Toes.R":      {"parent": "Foot.R",     "category": "leg"},
+
+    "Thumb1.L":  {"parent": "Hand.L",  "category": "finger", "optional": true},
+    "Thumb2.L":  {"parent": "Thumb1.L","category": "finger", "optional": true},
+    "Thumb3.L":  {"parent": "Thumb2.L","category": "finger", "optional": true},
+    "Thumb1.R":  {"parent": "Hand.R",  "category": "finger", "optional": true},
+    "Thumb2.R":  {"parent": "Thumb1.R","category": "finger", "optional": true},
+    "Thumb3.R":  {"parent": "Thumb2.R","category": "finger", "optional": true},
+
+    "Index1.L":  {"parent": "Hand.L",  "category": "finger", "optional": true},
+    "Index2.L":  {"parent": "Index1.L","category": "finger", "optional": true},
+    "Index3.L":  {"parent": "Index2.L","category": "finger", "optional": true},
+    "Index1.R":  {"parent": "Hand.R",  "category": "finger", "optional": true},
+    "Index2.R":  {"parent": "Index1.R","category": "finger", "optional": true},
+    "Index3.R":  {"parent": "Index2.R","category": "finger", "optional": true},
+
+    "Middle1.L": {"parent": "Hand.L",   "category": "finger", "optional": true},
+    "Middle2.L": {"parent": "Middle1.L","category": "finger", "optional": true},
+    "Middle3.L": {"parent": "Middle2.L","category": "finger", "optional": true},
+    "Middle1.R": {"parent": "Hand.R",   "category": "finger", "optional": true},
+    "Middle2.R": {"parent": "Middle1.R","category": "finger", "optional": true},
+    "Middle3.R": {"parent": "Middle2.R","category": "finger", "optional": true},
+
+    "Ring1.L":   {"parent": "Hand.L",  "category": "finger", "optional": true},
+    "Ring2.L":   {"parent": "Ring1.L", "category": "finger", "optional": true},
+    "Ring3.L":   {"parent": "Ring2.L", "category": "finger", "optional": true},
+    "Ring1.R":   {"parent": "Hand.R",  "category": "finger", "optional": true},
+    "Ring2.R":   {"parent": "Ring1.R", "category": "finger", "optional": true},
+    "Ring3.R":   {"parent": "Ring2.R", "category": "finger", "optional": true},
+
+    "Little1.L": {"parent": "Hand.L",   "category": "finger", "optional": true},
+    "Little2.L": {"parent": "Little1.L","category": "finger", "optional": true},
+    "Little3.L": {"parent": "Little2.L","category": "finger", "optional": true},
+    "Little1.R": {"parent": "Hand.R",   "category": "finger", "optional": true},
+    "Little2.R": {"parent": "Little1.R","category": "finger", "optional": true},
+    "Little3.R": {"parent": "Little2.R","category": "finger", "optional": true},
+
+    "UpperArm.Twist.L": {"parent": "UpperArm.L", "category": "twist", "optional": true},
+    "UpperArm.Twist.R": {"parent": "UpperArm.R", "category": "twist", "optional": true},
+    "LowerArm.Twist.L": {"parent": "LowerArm.L", "category": "twist", "optional": true},
+    "LowerArm.Twist.R": {"parent": "LowerArm.R", "category": "twist", "optional": true},
+    "UpperLeg.Twist.L": {"parent": "UpperLeg.L", "category": "twist", "optional": true},
+    "UpperLeg.Twist.R": {"parent": "UpperLeg.R", "category": "twist", "optional": true},
+    "LowerLeg.Twist.L": {"parent": "LowerLeg.L", "category": "twist", "optional": true},
+    "LowerLeg.Twist.R": {"parent": "LowerLeg.R", "category": "twist", "optional": true}
+  },
+  "spine_chain": ["Hips", "Spine", "Chest", "UpperChest", "Neck", "Head"],
+  "required_roles": [
+    "Hips", "Spine", "Chest", "Head",
+    "UpperArm.L", "UpperArm.R",
+    "UpperLeg.L", "UpperLeg.R"
+  ],
+  "secondary_role_patterns": [
+    {"prefix": "Breast",        "suffixes": [".L", ".R"],          "indexed": true},
+    {"prefix": "HairSecondary", "suffixes": [".C", ".L", ".R"],    "indexed": true},
+    {"prefix": "SkirtFront",    "suffixes": [".C"],                "indexed": true},
+    {"prefix": "SkirtBack",     "suffixes": [".C"],                "indexed": true},
+    {"prefix": "SkirtSide",     "suffixes": [".L", ".R"],          "indexed": true},
+    {"prefix": "Accessory",     "suffixes": [".C", ".L", ".R"],    "indexed": true}
+  ],
+  "verdict_values": ["keep", "drop"],
+  "drop_categories": ["aux", "twist", "ik_target", "null_locator", "duplicate"],
+  "special_role_tokens": {
+    "unknown": "validator_hard_fail",
+    "aux":     "auto_drop"
+  }
+}

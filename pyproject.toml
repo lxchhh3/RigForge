@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rigforge"
+version = "0.1.0"
+description = "Booth-asset assembly tool: produces a clean assembly FBX for MHWilds modding (consumed by REE-ModPilot)."
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+]
+api = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+
+[project.scripts]
+rigforge = "rigforge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rigforge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

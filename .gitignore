@@ -1,0 +1,45 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials*
+secrets*
+
+# RigForge-specific
+cache/
+data/training/
+data/ollama.json
+data/_inspect_cache/
+tests/_generated/
+*.fbx.bak
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/.vite/
+frontend/blob-report/
+
+# IDE / editor / Claude local
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

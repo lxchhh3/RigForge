@@ -1,0 +1,7 @@
+{
+  "host": "https://ollama.com",
+  "model": "deepseek-v3.1:671b-cloud",
+  "api_key": "REPLACE_WITH_YOUR_OLLAMA_API_KEY",
+  "timeout_seconds": 120,
+  "request_format": "json"
+}
