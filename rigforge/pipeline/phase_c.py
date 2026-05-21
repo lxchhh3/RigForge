@@ -1,26 +1,31 @@
 """Phase C — Armature merge (deterministic only).
 
-Two paths:
+Always produces `target_avatar.ascii + clothing's meshes/clusters spliced in`.
+The shape is identical in both branches; what differs is how clothing bones
+get mapped onto target bones for the cluster repoint pass:
 
-  (a) donor_id == target_id  →  PASS-THROUGH
-      Phase B already renamed donor-side names to canonical (= target-side)
-      and dropped aux bones. Apply those edits and return the bytes; no
-      structural merge is needed.
+  (a) donor_id == target_id  →  NAME-BASED REPOINT
+      Each clothing bone is matched to the target bone with the same name.
+      Clothing-specific extras (ornament bones the target doesn't carry)
+      survive via id_offset and ride along.
 
-  (b) donor_id != target_id  →  CROSS-AVATAR MERGE
-      Per PLAN.md Phase C steps 2–5:
-        2. drop clothing's bone Models + armature root
-        3. re-point cluster→bone connections to the target avatar's bone ids
-           (by canonical role lookup)
-        4. splice surviving clothing nodes into the target's Objects +
-           Connections sections
-        5. renumber clothing object ids with a safe offset to avoid id
-           collisions with target ids
+  (b) donor_id != target_id  →  ROLE-BASED REPOINT (LLM-driven)
+      Phase B's DecisionSet tells us each clothing bone's canonical role;
+      we look up the target's bone for that role in the avatar registry.
 
-      The strip and id-offset passes both rewrite the clothing ASCII; we
-      apply them in two passes (re-parsing between) so their edits cannot
-      overlap on the same byte ranges. The splice is the final pass on the
-      target ASCII.
+Steps shared by both branches:
+  1. Strip clothing's redundant bone Models (the ones we're repointing).
+  2. Apply user's clothing-side drops (LLM drops + UI mesh/channel drops +
+     DeformPercent overrides). Dedup donor materials/blendshapes by name.
+  3. Offset all remaining clothing object ids by a safe constant, using
+     `repoint_table` to redirect specific ids to their target counterparts.
+  4. Apply user's target-side drops + DeformPercent overrides on the target
+     ASCII before splice.
+  5. Splice clothing's surviving Objects + Connections into the target's
+     same-named sections.
+
+The strip + id-offset passes rewrite the clothing ASCII in two passes
+(re-parsing between) so their edits cannot overlap on the same byte ranges.
 """
 from __future__ import annotations
 
@@ -34,8 +39,6 @@ from rigforge.ascii_fbx.edits import (
     drop_bone_edits,
     drop_mesh_edits,
     drop_node_edit,
-    rename_bone_edits,
-    reparent_bone_edits,
     set_blend_shape_channel_deform_percent_edits,
 )
 from rigforge.ascii_fbx.lexer import parse as parse_fbx
@@ -43,6 +46,7 @@ from rigforge.ascii_fbx.merge import (
     bone_keep_strip_edits,
     id_offset_edits,
     splice_into_section_edit,
+    zero_weight_leaf_bone_ids,
 )
 from rigforge.ascii_fbx.sections import SectionView, extract
 from rigforge.avatars.registry import AvatarRegistry, CuratedAvatar
@@ -102,76 +106,35 @@ def run_phase_c(
     """
     notes: list[str] = []
 
-    if donor_id == target_id:
-        edits = _build_passthrough_edits(clothing_view, edit_plan, notes=notes)
-        # Clothing-side mesh drops apply equally in pass-through.
-        if drop_mesh_ids:
-            for mid in drop_mesh_ids:
-                edits.extend(drop_mesh_edits(clothing_view, mid))
-            notes.append(f"drop_meshes: removed {len(drop_mesh_ids)} clothing meshes")
-        if drop_blend_shape_channel_ids:
-            for cid in drop_blend_shape_channel_ids:
-                edits.extend(drop_blend_shape_channel_edits(clothing_view, cid))
-            notes.append(
-                f"drop_blend_shape_channels: removed "
-                f"{len(drop_blend_shape_channel_ids)} clothing channels"
-            )
-        if blend_shape_channel_overrides:
-            dropped_set = drop_blend_shape_channel_ids or set()
-            applied = 0
-            for cid, pct in blend_shape_channel_overrides.items():
-                if cid in dropped_set:
-                    continue
-                channel_edits = set_blend_shape_channel_deform_percent_edits(
-                    clothing_view, cid, pct,
-                )
-                if channel_edits:
-                    edits.extend(channel_edits)
-                    applied += 1
-            if applied:
-                notes.append(
-                    f"override: set DeformPercent on {applied} clothing channels"
-                )
-        edits = _dedupe_edits(edits)
-        edited = apply_edits(clothing_ascii, edits)
-        notes.append("merge: pass-through (donor==target)")
-        if target_drop_bone_ids:
-            notes.append(
-                f"ignore: target_drop_bone_ids ({len(target_drop_bone_ids)}) "
-                f"not applicable in pass-through"
-            )
-        if target_drop_mesh_ids:
-            notes.append(
-                f"ignore: target_drop_mesh_ids ({len(target_drop_mesh_ids)}) "
-                f"not applicable in pass-through"
-            )
-        if target_drop_blend_shape_channel_ids:
-            notes.append(
-                f"ignore: target_drop_blend_shape_channel_ids "
-                f"({len(target_drop_blend_shape_channel_ids)}) "
-                f"not applicable in pass-through"
-            )
-        if target_blend_shape_channel_overrides:
-            notes.append(
-                f"ignore: target_blend_shape_channel_overrides "
-                f"({len(target_blend_shape_channel_overrides)}) "
-                f"not applicable in pass-through"
-            )
-        return PhaseCResult(merged_ascii=edited, notes=notes)
-
-    if decisions is None:
-        raise PhaseCError(
-            "cross-avatar merge requires the DecisionSet (for canonical role "
-            "lookup); orchestrator must pass `decisions=`"
-        )
-
     target_avatar = registry.get(target_id)
-    merged = _run_cross_merge(
+    target_view = target_avatar.load_ascii_view()
+
+    # Build the donor→target bone repoint table. Two strategies depending on
+    # whether the clothing was rigged for THIS curated avatar already.
+    if donor_id == target_id:
+        repoint_table, kept_bone_ids = _build_name_based_repoint(
+            clothing_view, target_view, edit_plan, notes,
+        )
+        notes.append("merge: name-based repoint (donor==target)")
+    else:
+        if decisions is None:
+            raise PhaseCError(
+                "cross-avatar merge requires the DecisionSet (for canonical "
+                "role lookup); orchestrator must pass `decisions=`"
+            )
+        repoint_table, kept_bone_ids = _build_role_based_repoint(
+            decisions, target_avatar, notes,
+        )
+        notes.append("merge: role-based repoint (cross-avatar)")
+
+    merged = _run_merge(
         clothing_ascii=clothing_ascii,
         clothing_view=clothing_view,
         edit_plan=edit_plan,
-        decisions=decisions,
         target_avatar=target_avatar,
+        target_view=target_view,
+        repoint_table=repoint_table,
+        kept_bone_ids=kept_bone_ids,
         target_drop_bone_ids=target_drop_bone_ids or set(),
         target_drop_mesh_ids=target_drop_mesh_ids or set(),
         drop_mesh_ids=drop_mesh_ids or set(),
@@ -184,51 +147,95 @@ def run_phase_c(
     return PhaseCResult(merged_ascii=merged, notes=notes)
 
 
-# ---------------------------------------------------------------------------
-# Pass-through branch
-# ---------------------------------------------------------------------------
-
-
-def _build_passthrough_edits(
-    view: SectionView,
-    plan: EditPlan,
-    *,
+def _build_name_based_repoint(
+    clothing_view: SectionView,
+    target_view: SectionView,
+    edit_plan: EditPlan,
     notes: list[str],
-) -> list[TextEdit]:
-    edits: list[TextEdit] = []
-    for bone_id in plan.drops:
-        bone = view.bones.get(bone_id)
-        if bone is None:
-            notes.append(f"skip: drop target bone id={bone_id} not in view")
+) -> tuple[dict[int, int], set[int]]:
+    """For each clothing bone whose name matches a target bone, map the
+    clothing's id to the target's id. Used in the donor==target case where
+    the clothing is rigged for THIS curated avatar already — no LLM
+    classification needed.
+
+    Bones marked for drop by `edit_plan.drops` (user_drop or LLM verdict=drop)
+    are EXCLUDED from the repoint table so the strip pass routes them
+    through drop_bone_edits (full removal) rather than bone_keep_strip_edits
+    (just the Model, keep cluster connections for repoint).
+
+    Returns (repoint_table, kept_bone_ids). kept_bone_ids is the subset of
+    clothing bones whose Models get stripped during merge (they're
+    redundant; target owns the canonical copy). Clothing bones with no
+    matching name (clothing-specific ornament bones) stay — they get an
+    id offset and ride along into the merged output.
+    """
+    target_by_name: dict[str, int] = {}
+    for b in target_view.bones.values():
+        if b.name and b.type_class == "LimbNode":
+            target_by_name[b.name] = b.model_id
+    dropped = set(edit_plan.drops)
+    repoint_table: dict[int, int] = {}
+    kept_bone_ids: set[int] = set()
+    matched = 0
+    total = 0
+    for b in clothing_view.bones.values():
+        if b.type_class != "LimbNode":
             continue
-        edits.extend(drop_bone_edits(view, bone))
-    for bone_id, new_name in plan.renames.items():
-        bone = view.bones.get(bone_id)
-        if bone is None:
-            notes.append(f"skip: rename target bone id={bone_id} not in view")
+        total += 1
+        if b.model_id in dropped:
             continue
-        edits.extend(rename_bone_edits(view, bone, new_name))
-    for bone_id, new_parent_id in plan.reparents.items():
-        bone = view.bones.get(bone_id)
-        if bone is None:
-            notes.append(f"skip: reparent target bone id={bone_id} not in view")
+        tid = target_by_name.get(b.name)
+        if tid is None:
             continue
-        edits.extend(reparent_bone_edits(view, bone, new_parent_id))
-    return edits
+        repoint_table[b.model_id] = tid
+        kept_bone_ids.add(b.model_id)
+        matched += 1
+    notes.append(f"name-repoint: matched {matched}/{total} clothing bones to target")
+    return repoint_table, kept_bone_ids
+
+
+def _build_role_based_repoint(
+    decisions: DecisionSet,
+    target_avatar: CuratedAvatar,
+    notes: list[str],
+) -> tuple[dict[int, int], set[int]]:
+    """For each kept bone whose LLM-assigned role exists in the target's
+    canonical_to_name, map clothing's id to target's id. Used in the
+    cross-avatar case where bone names differ between donor and target."""
+    repoint_table: dict[int, int] = {}
+    kept_bone_ids: set[int] = set()
+    for d in decisions.bones:
+        if d.verdict != "keep":
+            continue
+        if d.role not in target_avatar.canonical_to_name:
+            # Target doesn't carry this role (e.g. a secondary chain the
+            # target lacks). Skip — the clothing bone will get an id offset
+            # and survive in the merged output unattached to a target bone.
+            continue
+        try:
+            tid = target_avatar.target_bone_id(d.role)
+        except KeyError as e:
+            notes.append(f"warn: target_bone_id({d.role!r}) lookup failed: {e}")
+            continue
+        repoint_table[d.model_id] = tid
+        kept_bone_ids.add(d.model_id)
+    return repoint_table, kept_bone_ids
 
 
 # ---------------------------------------------------------------------------
-# Cross-avatar merge branch
+# Merge body (shared by both branches)
 # ---------------------------------------------------------------------------
 
 
-def _run_cross_merge(
+def _run_merge(
     *,
     clothing_ascii: bytes,
     clothing_view: SectionView,
     edit_plan: EditPlan,
-    decisions: DecisionSet,
     target_avatar: CuratedAvatar,
+    target_view: SectionView,
+    repoint_table: dict[int, int],
+    kept_bone_ids: set[int],
     target_drop_bone_ids: set[int],
     target_drop_mesh_ids: set[int],
     drop_mesh_ids: set[int],
@@ -238,31 +245,11 @@ def _run_cross_merge(
     target_blend_shape_channel_overrides: dict[int, float],
     notes: list[str],
 ) -> bytes:
-    # Load target view once — needed by both the dedup pass below and the
-    # target-side drop pass later. Cheap (already cached at registry-load).
-    target_view = target_avatar.load_ascii_view()
+    # `repoint_table` + `kept_bone_ids` come pre-built from one of the two
+    # repoint-table builders (name-based or role-based). Everything below is
+    # strategy-agnostic — it just needs the donor→target id map.
 
-    # 1. Build clothing_bone_id -> target_bone_id repoint table.
-    #    Source: Phase B decisions where verdict=keep AND target has the role.
-    repoint_table: dict[int, int] = {}
-    kept_bone_ids: set[int] = set()
-    for d in decisions.bones:
-        if d.verdict != "keep":
-            continue
-        if d.role not in target_avatar.canonical_to_name:
-            # Target doesn't carry this role (e.g. a secondary chain the
-            # target lacks). Skip — its bone + clusters will be dropped at
-            # offset time because no cluster repoint applies.
-            continue
-        try:
-            tid = target_avatar.target_bone_id(d.role)
-        except KeyError as e:
-            notes.append(f"warn: target_bone_id({d.role!r}) lookup failed: {e}")
-            continue
-        repoint_table[d.model_id] = tid
-        kept_bone_ids.add(d.model_id)
-
-    # 2. Strip pass: drop kept-bone Models + their own upward parent refs.
+    # 1. Strip pass: drop kept-bone Models + their own upward parent refs.
     #    Connections where these bones are referenced AS PARENT stay so they
     #    can be repointed to target bone ids in the id_offset pass — that's
     #    how secondary chains (Hair, Breast, ornament bones) get reparented
@@ -298,24 +285,57 @@ def _run_cross_merge(
     if drop_mesh_ids:
         notes.append(f"drop_meshes: removed {len(drop_mesh_ids)} clothing meshes")
 
+    # Materials + BlendShapes dedup. Donor entities whose `name` collides with
+    # the target are stripped from the clothing side; their donor ids land in
+    # the repoint table so id_offset_edits rewrites surviving clothing
+    # connections (e.g. Geometry→Material, BlendShape→Geometry) to point at
+    # the target's already-present equivalents.
+    #
+    # Runs BEFORE per-channel user edits so we know which clothing channels
+    # are about to vanish via dedup — user drops/overrides on those would
+    # produce overlapping edits with the dedup drop_node_edit.
+    dedup_strip, dedup_repoint = _compute_dedup_repoint(
+        donor=clothing_view, target=target_view, notes=notes
+    )
+    strip_edits.extend(dedup_strip)
+    repoint_table.update(dedup_repoint)
+    # Donor channel ids that dedup will strip — used to silence redundant
+    # user drops + skip overrides on doomed channels.
+    dedup_stripped_channels = {
+        cid for cid in dedup_repoint if cid in clothing_view.blend_shape_channels
+    }
+
     # Apply user channel drops on the clothing side. Each channel is dropped
     # independently — its owning BlendShape Deformer survives (it may own
-    # other channels we're keeping).
+    # other channels we're keeping). Skip channels already covered by dedup
+    # (the drop edit would overlap the dedup drop_node_edit).
+    user_channel_drops_applied = 0
     for cid in drop_blend_shape_channel_ids:
+        if cid in dedup_stripped_channels:
+            continue
         strip_edits.extend(drop_blend_shape_channel_edits(clothing_view, cid))
+        user_channel_drops_applied += 1
     if drop_blend_shape_channel_ids:
         notes.append(
             f"drop_blend_shape_channels: removed "
-            f"{len(drop_blend_shape_channel_ids)} clothing channels"
+            f"{user_channel_drops_applied} clothing channels "
+            f"({len(drop_blend_shape_channel_ids) - user_channel_drops_applied} "
+            f"already covered by name-dedup)"
         )
 
     # Apply DeformPercent overrides on the clothing side. Skip channels in
-    # the drop set — the node is about to vanish, an edit on it would just
-    # collide with the drop_node_edit on the same byte range.
+    # (a) the drop set — the node is about to vanish; or (b) already being
+    # dedup-stripped — overriding a node that's about to be deleted causes
+    # overlapping edits. If the modder wants those channels' values changed,
+    # they should target the target's copy via target_blend_shape_channel_overrides.
     if blend_shape_channel_overrides:
         applied = 0
+        skipped_dedup = 0
         for cid, pct in blend_shape_channel_overrides.items():
             if cid in drop_blend_shape_channel_ids:
+                continue
+            if cid in dedup_stripped_channels:
+                skipped_dedup += 1
                 continue
             channel_edits = set_blend_shape_channel_deform_percent_edits(
                 clothing_view, cid, pct,
@@ -327,17 +347,11 @@ def _run_cross_merge(
             notes.append(
                 f"override: set DeformPercent on {applied} clothing channels"
             )
-
-    # Materials + BlendShapes dedup. Donor entities whose `name` collides with
-    # the target are stripped from the clothing side; their donor ids land in
-    # the repoint table so id_offset_edits rewrites surviving clothing
-    # connections (e.g. Geometry→Material, BlendShape→Geometry) to point at
-    # the target's already-present equivalents.
-    dedup_strip, dedup_repoint = _compute_dedup_repoint(
-        donor=clothing_view, target=target_view, notes=notes
-    )
-    strip_edits.extend(dedup_strip)
-    repoint_table.update(dedup_repoint)
+        if skipped_dedup:
+            notes.append(
+                f"override: skipped {skipped_dedup} overrides on dedup-stripped "
+                f"clothing channels (use target_blend_shape_channel_overrides instead)"
+            )
 
     strip_edits = _dedupe_edits(strip_edits)
     stripped = apply_edits(clothing_ascii, strip_edits)
@@ -420,6 +434,30 @@ def _run_cross_merge(
         splice_into_section_edit(target_doc, "Connections", connections_payload),
     ]
     merged = apply_edits(target_ascii, splice_edits)
+
+    # 6. Zero-weight bone sweep. Collaborator's verdict: cleanup of the
+    #    merged armature should aggressively drop bones that contribute no
+    #    skin weight to any vertex. Leaf-prune iteratively so dead chains
+    #    (e.g. `_end` markers, unused IK helpers) collapse end-first without
+    #    orphaning weighted descendants. Re-parses the merged bytes once.
+    merged_view = extract(parse_fbx(merged))
+    zero_weight_ids = zero_weight_leaf_bone_ids(merged_view)
+    if zero_weight_ids:
+        sweep_edits: list[TextEdit] = []
+        for bid in zero_weight_ids:
+            bone = merged_view.bones.get(bid)
+            if bone is None:
+                continue
+            sweep_edits.extend(drop_bone_edits(merged_view, bone))
+        sweep_edits = _dedupe_edits(sweep_edits)
+        merged = apply_edits(merged, sweep_edits)
+        notes.append(
+            f"zero_weight_sweep: dropped {len(zero_weight_ids)} bones with "
+            f"no skin influence (leaf-prune, iterative)"
+        )
+    else:
+        notes.append("zero_weight_sweep: nothing to drop")
+
     return merged
 
 

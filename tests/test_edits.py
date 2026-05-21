@@ -261,6 +261,92 @@ def test_drop_mesh_on_bone_model_returns_empty():
     assert apply_edits(MINI_MESH_FBX, drop_mesh_edits(view, 100)) == MINI_MESH_FBX
 
 
+# Mesh + blendshape chain: Body mesh with one BlendShape deformer owning one
+# channel that references one Shape geometry. Hair mesh has its own BlendShape
+# chain that must stay untouched when only Body is dropped.
+MINI_MESH_WITH_BLENDSHAPE_FBX = b"""\
+; FBX 7.4.0 project file
+Objects:  {
+\tModel: 200, "Model::Body", "Mesh" {
+\t}
+\tModel: 201, "Model::Hair", "Mesh" {
+\t}
+\tGeometry: 300, "Geometry::Body", "Mesh" {
+\t}
+\tGeometry: 301, "Geometry::Hair", "Mesh" {
+\t}
+\tGeometry: 900, "Geometry::Body_Smile_shape", "Shape" {
+\t}
+\tGeometry: 901, "Geometry::Hair_Wave_shape", "Shape" {
+\t}
+\tDeformer: 600, "Deformer::Body_BS", "BlendShape" {
+\t}
+\tDeformer: 601, "Deformer::Hair_BS", "BlendShape" {
+\t}
+\tDeformer: 700, "SubDeformer::Smile", "BlendShapeChannel" {
+\t\tDeformPercent: 0
+\t}
+\tDeformer: 701, "SubDeformer::Wave", "BlendShapeChannel" {
+\t\tDeformPercent: 0
+\t}
+}
+Connections:  {
+\tC: "OO",300,200
+\tC: "OO",301,201
+\tC: "OO",600,300
+\tC: "OO",601,301
+\tC: "OO",700,600
+\tC: "OO",701,601
+\tC: "OO",900,700
+\tC: "OO",901,701
+\tC: "OO",200,0
+\tC: "OO",201,0
+}
+"""
+
+
+def test_drop_mesh_cascades_to_blendshape_chain():
+    """Dropping a Mesh-Model cascades into the BlendShape graph attached to
+    its Geometry: the BlendShape deformer, every channel it owns, and every
+    Shape geometry those channels reference all get dropped together. Without
+    this the morph decls survive but the Geometry→BlendShape connection is
+    severed, leaving orphan shape keys that never render in Blender."""
+    doc = parse(MINI_MESH_WITH_BLENDSHAPE_FBX)
+    view = extract(doc)
+
+    edits = drop_mesh_edits(view, 200)  # drop Body
+    out = apply_edits(MINI_MESH_WITH_BLENDSHAPE_FBX, edits)
+
+    # Body chain gone (mesh + geometry + blendshape + channel + shape geom)
+    assert b'"Model::Body"' not in out
+    assert b'"Geometry::Body"' not in out
+    assert b'"Deformer::Body_BS"' not in out
+    assert b'"SubDeformer::Smile"' not in out
+    assert b'"Geometry::Body_Smile_shape"' not in out
+
+    # Hair chain untouched
+    assert b'"Model::Hair"' in out
+    assert b'"Geometry::Hair"' in out
+    assert b'"Deformer::Hair_BS"' in out
+    assert b'"SubDeformer::Wave"' in out
+    assert b'"Geometry::Hair_Wave_shape"' in out
+
+    # No surviving connection references any dropped id
+    out_doc = parse(out)
+    dropped = {200, 300, 600, 700, 900}
+    from rigforge.ascii_fbx.sections import parse_args
+    for c in out_doc.root("Connections").children:
+        if c.name != "C":
+            continue
+        args = parse_args(c.args_bytes(out))
+        if len(args) < 3:
+            continue
+        if args[1][0] == "num" and args[2][0] == "num":
+            sid, did = int(args[1][1]), int(args[2][1])
+            assert sid not in dropped, f"orphan src ref to dropped id {sid}"
+            assert did not in dropped, f"orphan dst ref to dropped id {did}"
+
+
 # --- drop blendshape channel edits ------------------------------------------
 
 

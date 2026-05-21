@@ -153,6 +153,8 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
        - every Geometry connected to that Model
        - every Skin Deformer connected to that Geometry
        - every Cluster SubDeformer connected to that Skin
+       - every BlendShape Deformer attached to that Geometry, plus its
+         BlendShapeChannels and the Shape geometries those channels reference
        - every Connection referencing any of the above
 
     Returns [] if `mesh_model_id` isn't a Mesh-type Model in the view — this
@@ -161,6 +163,12 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
     Bones are intentionally untouched: a bone often deforms multiple meshes
     (Maya rigs every bone into every skin), so cascading bone removal here
     would corrupt sibling meshes. Bone cleanup is a separate concern.
+
+    Blendshape cascade rationale: without it, the channel/shape decls survive
+    in the file but the Geometry→BlendShape connection is severed when the
+    mesh drops, leaving "orphan" morphs that never render in Blender/Maya.
+    The cascade only fires when the BlendShape is attached to the dropped
+    Geometry — BlendShapes on other meshes are untouched.
     """
     bone = view.bones.get(mesh_model_id)
     if bone is None or bone.type_class != "Mesh":
@@ -168,23 +176,43 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
     source = view.document.source
     edits: list[TextEdit] = [drop_node_edit(bone.node_ref, source)]
 
-    # Find Geometries owned by this Mesh-Model (reverse of geometry_owner_model).
     geom_ids: set[int] = {
         gid for gid, mid in view.geometry_owner_model.items()
         if mid == mesh_model_id
     }
-    # Find Skins deforming those geometries.
     skin_ids: set[int] = {
         s.skin_id for s in view.skins.values()
         if s.geometry_id is not None and s.geometry_id in geom_ids
     }
-    # Find Clusters belonging to those skins (reverse of cluster_skin).
     cluster_ids: set[int] = {
         cid for cid, sid in view.cluster_skin.items()
         if sid in skin_ids
     }
 
-    for gid in geom_ids:
+    # Cascade into the blendshape graph attached to the dropped Geometry.
+    # FBX convention: src=BlendShape, dst=Geometry  (deformer attached to mesh).
+    # We walk one pass over Connections, bucketing by direction, so we hit
+    # each row at most twice (BS-on-geom, channel-on-BS, shape-on-channel).
+    bs_ids: set[int] = set()
+    channel_ids: set[int] = set()
+    shape_geom_ids: set[int] = set()
+    oo_rows = list(_iter_oo_connections(view))
+    for s, d in oo_rows:
+        if d in geom_ids and s in view.blend_shapes:
+            bs_ids.add(s)
+    if bs_ids:
+        for s, d in oo_rows:
+            if d in bs_ids and s in view.blend_shape_channels:
+                channel_ids.add(s)
+    if channel_ids:
+        for s, d in oo_rows:
+            # Shape geometries point at channels and live in `geometries` too,
+            # but the dropped mesh geom is already in geom_ids — skip those.
+            if (d in channel_ids and s in view.geometries
+                    and s not in geom_ids):
+                shape_geom_ids.add(s)
+
+    for gid in geom_ids | shape_geom_ids:
         g = view.geometries.get(gid)
         if g is not None:
             edits.append(drop_node_edit(g.node_ref, source))
@@ -196,11 +224,44 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
         c = view.clusters.get(cid)
         if c is not None:
             edits.append(drop_node_edit(c.node_ref, source))
+    for bid in bs_ids:
+        bs = view.blend_shapes.get(bid)
+        if bs is not None:
+            edits.append(drop_node_edit(bs.node_ref, source))
+    for cid in channel_ids:
+        ch = view.blend_shape_channels.get(cid)
+        if ch is not None:
+            edits.append(drop_node_edit(ch.node_ref, source))
 
     edits.extend(_drop_connections_referencing(
-        view, ids={mesh_model_id, *geom_ids, *skin_ids, *cluster_ids},
+        view, ids={
+            mesh_model_id, *geom_ids, *skin_ids, *cluster_ids,
+            *bs_ids, *channel_ids, *shape_geom_ids,
+        },
     ))
     return edits
+
+
+def _iter_oo_connections(view: SectionView):
+    """Yield (src_id, dst_id) for every `C: "OO", src, dst` row in Connections.
+
+    Skips rows that don't have two numeric ids after the relation tag.
+    """
+    source = view.document.source
+    connections = view.document.root("Connections")
+    if connections is None:
+        return
+    for c in connections.children:
+        if c.name != "C":
+            continue
+        args = parse_args(c.args_bytes(source))
+        if len(args) < 3:
+            continue
+        src = _num(args[1])
+        dst = _num(args[2])
+        if src is None or dst is None:
+            continue
+        yield int(src), int(dst)
 
 
 def set_blend_shape_channel_deform_percent_edits(

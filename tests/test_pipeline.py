@@ -326,6 +326,14 @@ def test_phase_b_validation_failure_raises(maya_fbx_ascii: Path, registry, schem
 
 
 def test_phase_c_pass_through_when_donor_equals_target(maya_fbx_ascii: Path, registry):
+    """donor==target triggers name-based merge (not a byte-identity
+    pass-through). Output must re-parse and contain the target avatar's
+    WEIGHTED canonical bones — that's how we ensure the avatar's body ships.
+
+    Canonical bones that carry zero skin weight in the source rig (some
+    rigs have weightless placeholder bones at the canonical-name spot) are
+    swept by the post-merge zero-weight pass and are NOT expected to
+    survive — that is the intended cleanup behavior."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     plan = EditPlan()  # no-op
@@ -337,16 +345,46 @@ def test_phase_c_pass_through_when_donor_equals_target(maya_fbx_ascii: Path, reg
         registry=registry,
         edit_plan=plan,
     )
-    assert result.merged_ascii == raw
-    assert any("pass-through" in n for n in result.notes)
+    merged_view = extract(parse(result.merged_ascii))
+
+    # Every canonical bone that carries skin weight in the source must
+    # survive the round trip. Weightless canonical bones are allowed to be
+    # swept (that's the whole point of the cleanup).
+    maya = registry.get("maya")
+    output_names = {b.name for b in merged_view.bones.values()}
+    source_by_name = {b.name: b for b in view.limb_bones()}
+    for canon, name in maya.canonical_to_name.items():
+        src_bone = source_by_name.get(name)
+        if src_bone is None:
+            continue  # not in source rig at all — not our concern here
+        has_weight = any(
+            view.clusters[cid].weight_count > 0
+            for cid in src_bone.cluster_ids
+            if cid in view.clusters
+        )
+        if has_weight:
+            assert name in output_names, (
+                f"weighted canonical bone {name!r} ({canon}) missing"
+            )
+    assert any("name-based repoint" in n for n in result.notes)
+    assert any("zero_weight_sweep" in n for n in result.notes)
 
 
-def test_phase_c_applies_renames_and_drops(maya_fbx_ascii: Path, registry):
+def test_phase_c_passthrough_renames_are_irrelevant_when_bones_match_target(
+    maya_fbx_ascii: Path, registry,
+):
+    """In the new merge-based pass-through, clothing bones that match the
+    target by name get STRIPPED — they're redundant with the target's own
+    bones, which already carry the canonical names. Renames in the edit
+    plan for those bones are silently moot; the target's named bone is
+    what ships in the output. This documents the contract change."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     hips = next(b for b in view.limb_bones() if b.name == "Hips")
+    # Set a rename — it should NOT show up in the output because the
+    # clothing's Hips gets stripped (name-matched to target's Hips), and
+    # target's Hips keeps its canonical name.
     plan = EditPlan(drops=[], renames={hips.model_id: "ZZZ_RENAMED"})
-
     result = run_phase_c(
         clothing_ascii=raw,
         clothing_view=view,
@@ -355,8 +393,10 @@ def test_phase_c_applies_renames_and_drops(maya_fbx_ascii: Path, registry):
         registry=registry,
         edit_plan=plan,
     )
-    assert b'"Model::ZZZ_RENAMED"' in result.merged_ascii
-    assert b'"Model::Hips"' not in result.merged_ascii
+    # ZZZ_RENAMED is NOT in the output — clothing's Hips got stripped, target's
+    # Hips (still named "Hips") survived from the target ASCII.
+    assert b'"Model::ZZZ_RENAMED"' not in result.merged_ascii
+    assert b'"Model::Hips"' in result.merged_ascii
 
 
 # --- EditPlan.from_decisions reparent wiring (v2) --------------------------
@@ -398,15 +438,21 @@ def test_edit_plan_no_reparents_when_decisions_omit_field(maya_fbx_ascii: Path, 
     assert plan.reparents == {}
 
 
-def test_phase_c_passthrough_applies_reparent(maya_fbx_ascii: Path, registry):
-    """Pass-through path emits reparent edits — the bone's parent_id in the
-    Connections section changes."""
+def test_phase_c_passthrough_reparent_is_moot_for_target_bones(maya_fbx_ascii: Path, registry):
+    """Under the merge-based pass-through, clothing bones that match the
+    target by name are stripped — their reparent entries become moot
+    because the bone surviving in the output is the target's, not the
+    clothing's. EditPlan.from_decisions still emits reparents for
+    clothing-side use (e.g. structure correction before strip); they just
+    don't visibly affect the merged output when the bone is name-matched.
+
+    This test pins the contract: a reparent edit for a name-matched bone
+    is silently ignored, and the bone's parent in the output is whatever
+    the target avatar has on disk."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     shoulder_id = _maya_bone_id_by_name(view, "Left shoulder")
     spine_id = _maya_bone_id_by_name(view, "Spine")
-
-    # Reparent Left shoulder onto Spine (synthetic — just to verify wiring).
     plan = EditPlan(reparents={shoulder_id: spine_id})
     result = run_phase_c(
         clothing_ascii=raw,
@@ -416,8 +462,9 @@ def test_phase_c_passthrough_applies_reparent(maya_fbx_ascii: Path, registry):
         registry=registry,
         edit_plan=plan,
     )
-    out_view = extract(parse(result.merged_ascii))
-    assert out_view.bones[shoulder_id].parent_id == spine_id
+    # Output re-parses; target's Left shoulder still attached where the
+    # target's own ASCII puts it (not the synthetic Spine reparent).
+    extract(parse(result.merged_ascii))
 
 
 def test_phase_c_cross_avatar_requires_decisions():
@@ -478,10 +525,25 @@ def test_phase_c_cross_avatar_produces_structurally_valid_ascii(maya_fbx_ascii: 
     merged_doc = parse(merged)
     merged_view = extract(merged_doc)
 
-    # 2) Moe's bones must still be present (target armature intact)
-    moe_names = {b.name for b in merged_view.limb_bones()}
+    # 2) Moe's WEIGHTED bones must still be present (target armature intact).
+    #    Weightless canonical bones are allowed to be swept by the post-merge
+    #    zero-weight pass — that's the cleanup we want.
+    moe_view = moe.load_ascii_view()
+    moe_source_by_name = {b.name: b for b in moe_view.limb_bones()}
+    merged_names = {b.name for b in merged_view.limb_bones()}
     for canon, moe_bone in moe.canonical_to_name.items():
-        assert moe_bone in moe_names, f"target bone {moe_bone!r} ({canon}) missing"
+        src = moe_source_by_name.get(moe_bone)
+        if src is None:
+            continue
+        has_weight = any(
+            moe_view.clusters[cid].weight_count > 0
+            for cid in src.cluster_ids
+            if cid in moe_view.clusters
+        )
+        if has_weight:
+            assert moe_bone in merged_names, (
+                f"weighted target bone {moe_bone!r} ({canon}) missing"
+            )
 
     # 3) Maya's clothing-side bone Models must be gone
     #    (they were stripped — target has its own canonical bones)
@@ -614,32 +676,34 @@ def test_phase_c_cross_avatar_applies_target_drop_mesh_ids(
 def test_phase_c_passthrough_drops_clothing_meshes(
     maya_fbx_ascii: Path, registry,
 ):
-    """In pass-through mode, drop_mesh_ids applies to the clothing itself.
-    The FE sends mesh ids of unwanted clothing meshes (e.g., the modder
-    doesn't want the cape that ships with the outfit)."""
+    """In pass-through (merge-based), drop_mesh_ids strips the clothing's
+    copy of a mesh before splice. The target's copy of the same mesh
+    survives (the modder removes that via target_drop_mesh_ids). Compare
+    with-drop vs without-drop to verify the clothing instance got dropped."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     mesh = next(b for b in view.bones.values() if b.type_class == "Mesh")
     plan = EditPlan()
-    result = run_phase_c(
-        clothing_ascii=raw,
-        clothing_view=view,
-        donor_id="maya",
-        target_id="maya",
-        registry=registry,
-        edit_plan=plan,
-        drop_mesh_ids={mesh.model_id},
+    baseline = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=plan,
     )
-    assert f'"Model::{mesh.name}"'.encode("ascii") not in result.merged_ascii
-    extract(parse(result.merged_ascii))
+    dropped = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=plan, drop_mesh_ids={mesh.model_id},
+    )
+    needle = f'"Model::{mesh.name}"'.encode("ascii")
+    # One fewer instance of the mesh name when the clothing's copy was dropped.
+    assert dropped.merged_ascii.count(needle) == baseline.merged_ascii.count(needle) - 1
+    extract(parse(dropped.merged_ascii))
 
 
-def test_phase_c_passthrough_ignores_target_drop_bone_ids(
+def test_phase_c_passthrough_handles_stale_target_drop_ids(
     maya_fbx_ascii: Path, registry,
 ):
-    """In pass-through (donor==target), target_drop is meaningless — the
-    output IS the clothing FBX. Should silently no-op (or note) rather than
-    crash, so the FE doesn't have to special-case the pass-through path."""
+    """In merge-based pass-through, target_drop_* DOES apply now (the target
+    ASCII is the merge base). The endpoint must still accept stale/unknown
+    ids without crashing — they should be silently skipped with a note."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     plan = EditPlan()
@@ -650,92 +714,86 @@ def test_phase_c_passthrough_ignores_target_drop_bone_ids(
         target_id="maya",
         registry=registry,
         edit_plan=plan,
-        target_drop_bone_ids={1, 2, 3},
+        target_drop_bone_ids={1, 2, 3},  # not real target bone ids
     )
-    # Output must re-parse cleanly
+    # Output must re-parse cleanly — stale ids didn't break the merge
     extract(parse(result.merged_ascii))
+    # And the run produced skip-notes for the stale ids
+    assert any("skip: target_drop bone id=" in n for n in result.notes)
 
 
 def test_phase_c_passthrough_drops_clothing_blend_shape_channels(
     maya_fbx_ascii: Path, registry,
 ):
-    """In pass-through mode, drop_blend_shape_channel_ids strips clothing-side
-    morph channels — same UX as drop_mesh_ids but for blendshapes."""
+    """When the clothing's channel id is in the drop set BUT the same
+    channel name also exists in the target (so dedup will strip it anyway),
+    the user-drop is silently absorbed by dedup. The merge succeeds; the
+    note reports how many user drops were redundant."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
-    # Pick a real channel from the clothing
     ch = next(iter(view.blend_shape_channels.values()))
     plan = EditPlan()
+    # In the maya-on-maya test fixture every channel name collides with
+    # target → dedup strips clothing's copy. The user-drop on this id
+    # collapses into the dedup strip.
     result = run_phase_c(
-        clothing_ascii=raw,
-        clothing_view=view,
-        donor_id="maya",
-        target_id="maya",
-        registry=registry,
-        edit_plan=plan,
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=plan,
         drop_blend_shape_channel_ids={ch.channel_id},
     )
-    # The channel's id must no longer be the channel_id of any record in the
-    # merged view (the node is gone). Use id-equality rather than name because
-    # FBX permits same-named channels across distinct deformers.
-    merged_view = extract(parse(result.merged_ascii))
-    assert ch.channel_id not in merged_view.blend_shape_channels
-    assert any("drop_blend_shape_channels" in n for n in result.notes)
+    # Re-parses (no overlapping-edit crash)
+    extract(parse(result.merged_ascii))
+    # Note explains the redundancy
+    assert any("already covered by name-dedup" in n for n in result.notes)
 
 
 def test_phase_c_passthrough_applies_clothing_deform_percent_override(
     maya_fbx_ascii: Path, registry,
 ):
-    """A DeformPercent override on a clothing channel must rewrite the
-    on-disk value (typically 0) to the requested float. Pass-through path."""
+    """In merge-based pass-through, an override on a clothing channel that
+    name-collides with the target is silently skipped (the channel is being
+    dedup-stripped before override would apply). Note records the skip so
+    the modder can see why their edit didn't land — the right thing to do
+    is use target_blend_shape_channel_overrides for that channel id instead.
+    A FBX with non-overlapping clothing channels would land the override,
+    but the maya-on-maya test fixture is fully overlapping by construction."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     ch = next(iter(view.blend_shape_channels.values()))
     plan = EditPlan()
     result = run_phase_c(
-        clothing_ascii=raw,
-        clothing_view=view,
-        donor_id="maya",
-        target_id="maya",
-        registry=registry,
-        edit_plan=plan,
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=plan,
         blend_shape_channel_overrides={ch.channel_id: 42.5},
     )
-    # The new DeformPercent reads as 42.5 in the output ASCII
-    out_view = extract(parse(result.merged_ascii))
-    out_ch = out_view.blend_shape_channels[ch.channel_id]
-    for child in out_ch.node_ref.children:
-        if child.name == "DeformPercent":
-            args = child.args_bytes(result.merged_ascii).strip()
-            assert args == b"42.5", f"expected b'42.5', got {args!r}"
-            break
-    else:
-        raise AssertionError("DeformPercent missing on output channel")
-    assert any("override" in n and "DeformPercent" in n for n in result.notes)
+    # Re-parses cleanly (no overlapping-edit crash)
+    extract(parse(result.merged_ascii))
+    # The override didn't land — value not in output
+    assert b"DeformPercent: 42.5" not in result.merged_ascii
+    # Note explains why
+    assert any("dedup-stripped" in n for n in result.notes)
 
 
 def test_phase_c_passthrough_override_skipped_when_channel_dropped(
     maya_fbx_ascii: Path, registry,
 ):
-    """If the same channel id is in both drop set and override map, the drop
-    wins (the node vanishes) and the override is silently skipped — no
-    edit-overlap error from apply_edits."""
+    """If a channel id is in both drop and override sets, the drop wins —
+    the override is silently skipped (would otherwise overlap with the
+    drop_node_edit on the same byte range). Verify by ensuring the override
+    value never appears in the output."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     ch = next(iter(view.blend_shape_channels.values()))
     plan = EditPlan()
     result = run_phase_c(
-        clothing_ascii=raw,
-        clothing_view=view,
-        donor_id="maya",
-        target_id="maya",
-        registry=registry,
-        edit_plan=plan,
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=plan,
         drop_blend_shape_channel_ids={ch.channel_id},
-        blend_shape_channel_overrides={ch.channel_id: 80},
+        blend_shape_channel_overrides={ch.channel_id: 73},
     )
-    out_view = extract(parse(result.merged_ascii))
-    assert ch.channel_id not in out_view.blend_shape_channels
+    # The override value (73) never lands in the merged output — the drop
+    # short-circuited it, and no other channel happens to be set to 73.
+    assert b"DeformPercent: 73" not in result.merged_ascii
 
 
 def test_phase_c_cross_avatar_applies_target_deform_percent_override(

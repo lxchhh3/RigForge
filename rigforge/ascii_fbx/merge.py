@@ -296,6 +296,54 @@ def bone_keep_strip_edits(view: SectionView, bone: BoneRecord) -> list[TextEdit]
 
 
 # ---------------------------------------------------------------------------
+# Zero-weight bone sweep (post-merge cleanup)
+# ---------------------------------------------------------------------------
+
+
+def zero_weight_leaf_bone_ids(view: SectionView) -> set[int]:
+    """Identify LimbNode bones that contribute no skin weight to any vertex
+    AND have no surviving non-zero-weight descendants. Iterative leaf prune:
+    a bone enters the drop set when every cluster attached to it has
+    `weight_count == 0` (or it has no clusters at all) AND every one of its
+    children is already in the drop set. The pass repeats until stable, so a
+    chain of dead end-markers collapses entirely.
+
+    Why leaf-only: dropping a mid-chain weightless bone would orphan its
+    weighted descendants (parent connection goes away, children float). Leaf
+    pruning is the safe form of the collaborator's "aggressively wipe every
+    0-weight bone" guidance — almost every zero-weight bone in a real rig is
+    a chain tip (`_end` markers, IK helpers, unused secondary chains), and
+    iterating catches the chain wholesale even when intermediate nodes have
+    no weight themselves.
+
+    Does NOT touch Mesh / Null type Models, only LimbNodes.
+    """
+    drop: set[int] = set()
+    while True:
+        progress = False
+        for bid, bone in view.bones.items():
+            if bid in drop:
+                continue
+            if bone.type_class != "LimbNode":
+                continue
+            kept_children = [c for c in bone.children_ids if c not in drop]
+            if kept_children:
+                continue
+            has_weight = False
+            for cid in bone.cluster_ids:
+                cluster = view.clusters.get(cid)
+                if cluster is not None and cluster.weight_count > 0:
+                    has_weight = True
+                    break
+            if has_weight:
+                continue
+            drop.add(bid)
+            progress = True
+        if not progress:
+            return drop
+
+
+# ---------------------------------------------------------------------------
 # Splice
 # ---------------------------------------------------------------------------
 

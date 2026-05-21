@@ -19,6 +19,7 @@ from rigforge.ascii_fbx.merge import (
     id_offset_edits,
     positioned_args,
     splice_into_section_edit,
+    zero_weight_leaf_bone_ids,
 )
 from rigforge.ascii_fbx.sections import extract
 
@@ -232,3 +233,115 @@ def test_splice_into_section_inserts_before_closing_brace():
     assert b"Foo: 999, \"Foo::Bar\"" in out[obj_open:obj_close]
     # Connections section remains intact
     assert b"Connections:  {" in out
+
+
+# --- zero-weight leaf sweep ------------------------------------------------
+
+
+# Chain: Spine (weighted) -> Hand (weighted) -> Hand_end (zero weight, leaf).
+# Sibling chain off Spine: HelperA (no cluster at all) -> HelperB (cluster
+# with weight_count=0). All three weightless nodes should be pruned; the
+# weighted core (Spine, Hand) survives.
+ZERO_WEIGHT_SAMPLE = b"""FBXHeaderExtension:  {
+\tFBXHeaderVersion: 1003
+}
+Objects:  {
+\tModel: 100, "Model::Spine", "LimbNode" {
+\t}
+\tModel: 200, "Model::Hand", "LimbNode" {
+\t}
+\tModel: 300, "Model::Hand_end", "LimbNode" {
+\t}
+\tModel: 400, "Model::HelperA", "LimbNode" {
+\t}
+\tModel: 500, "Model::HelperB", "LimbNode" {
+\t}
+\tGeometry: 90, "Geometry::Body", "Mesh" {
+\t}
+\tDeformer: 80, "Deformer::Body_Skin", "Skin" {
+\t}
+\tDeformer: 1000, "SubDeformer::Spine_Cluster", "Cluster" {
+\t\tIndexes: *3 {
+\t\t\ta: 0,1,2
+\t\t}
+\t}
+\tDeformer: 1001, "SubDeformer::Hand_Cluster", "Cluster" {
+\t\tIndexes: *2 {
+\t\t\ta: 3,4
+\t\t}
+\t}
+\tDeformer: 1002, "SubDeformer::Hand_end_Cluster", "Cluster" {
+\t\tIndexes: *0 {
+\t\t}
+\t}
+\tDeformer: 1005, "SubDeformer::HelperB_Cluster", "Cluster" {
+\t\tIndexes: *0 {
+\t\t}
+\t}
+}
+Connections:  {
+\tC: "OO",100,0
+\tC: "OO",200,100
+\tC: "OO",300,200
+\tC: "OO",400,100
+\tC: "OO",500,400
+\tC: "OO",100,1000
+\tC: "OO",200,1001
+\tC: "OO",300,1002
+\tC: "OO",500,1005
+\tC: "OO",1000,80
+\tC: "OO",1001,80
+\tC: "OO",1002,80
+\tC: "OO",1005,80
+\tC: "OO",80,90
+}
+"""
+
+
+def test_zero_weight_sweep_drops_leaf_with_zero_count_cluster():
+    """A leaf bone whose only cluster has Indexes: *0 must be flagged for
+    drop. weight_count==0 means no vertex is skinned to this bone — it
+    contributes nothing to deformation."""
+    view = extract(parse_fbx(ZERO_WEIGHT_SAMPLE))
+    ids = zero_weight_leaf_bone_ids(view)
+    assert 300 in ids, "Hand_end (zero-count cluster, leaf) must be dropped"
+
+
+def test_zero_weight_sweep_drops_bone_with_no_cluster():
+    """A leaf bone with no cluster at all has no skin influence by definition
+    and must be swept."""
+    view = extract(parse_fbx(ZERO_WEIGHT_SAMPLE))
+    ids = zero_weight_leaf_bone_ids(view)
+    assert 400 in ids, "HelperA (no cluster) must be dropped after HelperB goes"
+    assert 500 in ids, "HelperB (zero-count cluster, leaf) must be dropped"
+
+
+def test_zero_weight_sweep_preserves_weighted_chain():
+    """Bones with non-zero weight clusters survive, even if a sibling has
+    zero weight. The whole point of leaf-pruning is to keep the deforming
+    skeleton intact."""
+    view = extract(parse_fbx(ZERO_WEIGHT_SAMPLE))
+    ids = zero_weight_leaf_bone_ids(view)
+    assert 100 not in ids, "Spine has weight, must survive"
+    assert 200 not in ids, "Hand has weight, must survive"
+
+
+def test_zero_weight_sweep_iterates_until_stable():
+    """HelperA has no cluster but its CHILD (HelperB) does — except HelperB's
+    cluster is zero-count. Iteration must catch HelperB on pass 1, then
+    HelperA on pass 2 once HelperB is in the drop set (so HelperA has no
+    kept children). Single-pass would miss HelperA."""
+    view = extract(parse_fbx(ZERO_WEIGHT_SAMPLE))
+    ids = zero_weight_leaf_bone_ids(view)
+    assert {300, 400, 500} <= ids
+
+
+def test_zero_weight_sweep_skips_non_limb_models():
+    """Mesh and Null Models are out of scope — only LimbNode bones can be
+    swept. A free-floating Mesh-Model with no cluster is still meant to
+    appear in the output."""
+    view = extract(parse_fbx(ZERO_WEIGHT_SAMPLE))
+    ids = zero_weight_leaf_bone_ids(view)
+    for bid in ids:
+        bone = view.bones[bid]
+        assert bone.type_class == "LimbNode"
