@@ -205,6 +205,102 @@ def test_phase_b_user_drop_doesnt_break_canonical(maya_fbx_ascii: Path, registry
         assert r in kept and kept[r], f"required role {r} missing after user drop"
 
 
+def test_phase_b_unknown_role_falls_back_to_secondary(
+    maya_fbx_ascii: Path, registry, schema,
+):
+    """When the LLM emits role='unknown', Phase B rewrites in place to
+    role='Secondary.<bone.name>' with verdict='keep' so the pipeline keeps
+    moving rather than hard-failing. Surfaces as a warning, not an error."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    limbs = view.limb_bones()
+    # Take a working identity classification, then corrupt two non-canonical
+    # bones to role='unknown' to exercise the fallback path.
+    decisions = _maya_identity_decisions(view)
+    by_id = {d.model_id: i for i, d in enumerate(decisions.bones)}
+    secondaries = [b for b in limbs if b.name not in
+                   {v for v in registry.get("maya").canonical_to_name.values()}]
+    assert len(secondaries) >= 2, "fixture broken: need 2+ secondary bones"
+    unknown_ids = [secondaries[0].model_id, secondaries[1].model_id]
+    for uid in unknown_ids:
+        decisions.bones[by_id[uid]] = Decision(
+            model_id=uid, role="unknown", verdict="keep",
+        )
+    mock = MockLLMClient(decisions, model_id="test-unknown-fallback")
+
+    result = run_phase_b(
+        view=view, donor_id="maya", target_id="maya",
+        registry=registry, schema=schema, llm_client=mock,
+    )
+
+    # Each unknown rewritten to Secondary.<bone.name>; original name preserved
+    for uid in unknown_ids:
+        d = result.decisions.by_id()[uid]
+        bone = view.bones[uid]
+        assert d.role == f"Secondary.{bone.name}", (
+            f"expected Secondary.{bone.name}, got {d.role!r}"
+        )
+        assert d.verdict == "keep"
+    # Warnings carry the fallback record
+    fallback_warnings = [w for w in result.warnings if w.rule == "unknown_role_fallback"]
+    assert len(fallback_warnings) == len(unknown_ids)
+    # No renames emitted for the rewritten bones (Secondary roles aren't in
+    # canonical_to_name → bone keeps its on-disk name)
+    for uid in unknown_ids:
+        assert uid not in result.edit_plan.renames
+
+
+def test_phase_b_unknown_fallback_handles_reprompt(
+    maya_fbx_ascii: Path, registry, schema,
+):
+    """The re-prompt round can also emit 'unknown'; the fallback applies
+    there too. Use a tiny sequential mock so the first call returns a
+    violating set (Hips assigned twice) AND has an 'unknown' bone, then the
+    re-prompt returns a clean set still containing an 'unknown'. Both
+    unknowns must be rewritten and surfaced as warnings."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    limbs = view.limb_bones()
+
+    canonical_names = set(registry.get("maya").canonical_to_name.values())
+    secondaries = [b for b in limbs if b.name not in canonical_names]
+    assert len(secondaries) >= 3, "fixture broken: need 3+ secondary bones"
+
+    # First call: dup Hips (forces re-prompt) + one 'unknown'
+    first = _maya_identity_decisions(view)
+    by_id_first = {d.model_id: i for i, d in enumerate(first.bones)}
+    first.bones[by_id_first[secondaries[0].model_id]] = Decision(
+        model_id=secondaries[0].model_id, role="unknown", verdict="keep",
+    )
+    first.bones[by_id_first[secondaries[2].model_id]] = Decision(
+        model_id=secondaries[2].model_id, role="Hips", verdict="keep",
+    )
+
+    # Re-prompt response: clean, but still has one 'unknown' on another bone
+    second = _maya_identity_decisions(view)
+    by_id_second = {d.model_id: i for i, d in enumerate(second.bones)}
+    second.bones[by_id_second[secondaries[1].model_id]] = Decision(
+        model_id=secondaries[1].model_id, role="unknown", verdict="keep",
+    )
+
+    class _SequentialMock:
+        model_id = "test-reprompt-unknown"
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self._i = 0
+        def classify(self, request):
+            r = self._responses[min(self._i, len(self._responses) - 1)]
+            self._i += 1
+            return r
+
+    mock = _SequentialMock([first, second])
+    result = run_phase_b(
+        view=view, donor_id="maya", target_id="maya",
+        registry=registry, schema=schema, llm_client=mock,
+    )
+    # Both rounds' unknowns landed as fallback warnings
+    fallback_warnings = [w for w in result.warnings if w.rule == "unknown_role_fallback"]
+    assert len(fallback_warnings) >= 2
+
+
 def test_phase_b_validation_failure_raises(maya_fbx_ascii: Path, registry, schema):
     """A decision set that violates unique_role (Hips assigned twice) must
     surface as PhaseBError after the re-prompt fails."""

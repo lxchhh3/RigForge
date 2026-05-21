@@ -83,6 +83,17 @@ def run_phase_b(
         if cache is not None:
             cache.put(key, decisions)
 
+    # Unknown-role fallback: when the LLM emits role='unknown' (its "I refuse
+    # to classify" sentinel), rewrite the decision in place to
+    # role='Secondary.<bone.name>' with verdict='keep'. This preserves the
+    # bone with its original name — Secondary roles aren't in
+    # canonical_to_name so EditPlan emits no rename. Surfaces as a warning
+    # in the manifest so the modder can see which bones got the fallback.
+    # Runs BEFORE user-drop and validation so downstream code never sees
+    # 'unknown'. Real assemble runs on unusual Booth clothing hit this often
+    # enough that hard-failing is more frustrating than a soft fallback.
+    fallback_warnings = _rewrite_unknown_to_secondary(decisions, view)
+
     # User-drop pre-filter: cascade the user's chosen drops to every transitive
     # descendant, then force their verdict to "drop" regardless of LLM output.
     # Runs BEFORE validation so the post-override decision set is what the
@@ -100,6 +111,11 @@ def run_phase_b(
         decisions = llm_client.classify(reprompt_request)
         if cache is not None:
             cache.put(key, decisions)
+        # Re-prompt round also gets the fallback (the LLM may again emit
+        # 'unknown'; same handling applies).
+        fallback_warnings.extend(_rewrite_unknown_to_secondary(decisions, view))
+        if user_drop_bone_ids:
+            _apply_user_drops(decisions, view, user_drop_bone_ids)
         violations = validate_all(decisions, view, schema)
         errs = errors(violations)
         if errs:
@@ -113,10 +129,48 @@ def run_phase_b(
     return PhaseBResult(
         decisions=decisions,
         edit_plan=plan,
-        warnings=warnings(violations),
+        warnings=warnings(violations) + fallback_warnings,
         cache_hit=cache_hit,
         cache_key=key,
     )
+
+
+def _rewrite_unknown_to_secondary(
+    decisions: DecisionSet,
+    view: SectionView,
+) -> list[Violation]:
+    """Mutate `decisions` in place: rewrite every role='unknown' to
+    role='Secondary.<bone.name>' with verdict='keep'.
+
+    Returns one warning Violation per rewritten bone so the manifest +
+    PhaseBResult.warnings carry a record of the fallback. Bones not in the
+    view (stale ids) are still rewritten to Secondary.<unknown> so the
+    decision stays well-formed.
+    """
+    out: list[Violation] = []
+    for i, d in enumerate(decisions.bones):
+        if d.role != "unknown":
+            continue
+        bone = view.bones.get(d.model_id)
+        bone_name = bone.name if bone is not None and bone.name else "unknown"
+        new_role = f"Secondary.{bone_name}"
+        decisions.bones[i] = Decision(
+            model_id=d.model_id,
+            role=new_role,
+            verdict="keep",
+            drop_category=None,
+            confidence=d.confidence,
+        )
+        out.append(Violation(
+            severity="warning",
+            rule="unknown_role_fallback",
+            message=(
+                f"bone {d.model_id} ({bone_name!r}) was emitted as 'unknown' "
+                f"by the LLM; rewrote to role={new_role!r} verdict='keep'"
+            ),
+            bone_ids=[d.model_id],
+        ))
+    return out
 
 
 def _apply_user_drops(
