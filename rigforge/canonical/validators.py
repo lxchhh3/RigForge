@@ -175,20 +175,33 @@ def rule_l_r_pairing(
 # ---------------------------------------------------------------------------
 
 
+# Threshold for the spine-ascent check. We don't require strict > 0 because
+# real rigs sometimes co-locate adjacent joints (e.g. Neck and Head pivots at
+# the same point, with the actual head pose encoded by rotation, not
+# translation). FBX export precision can also push these tiny offsets just
+# below zero (e.g. -0.0086). Only flag bones that are more than 5cm below
+# their parent — that's a genuine inversion, not measurement noise.
+_SPINE_ASCENT_TOLERANCE = -0.05
+
+
 def rule_monotonic_spine_y(
     decisions: DecisionSet,
     view: SectionView,
     schema: CanonicalSchema,
 ) -> list[Violation]:
-    """Spine chain ys must be monotonically increasing (Hips < Spine < ... < Head).
+    """Spine chain Lcl Y should ascend or stay near-zero (Hips < Spine < ... < Head).
 
-    Y is in *world* space if we summed translations along the chain. Booth FBX
-    Lcl Translations are parent-relative — but spine segments are nearly
-    aligned along +Y from Hips, so each successive Y delta should be positive
-    (i.e. each child's Lcl Y > 0 when measured from its parent).
+    Booth FBX Lcl Translations are parent-relative — but spine segments are
+    nearly aligned along +Y from Hips, so each successive Y delta should be
+    positive (the child is offset upward from its parent). Two real-world
+    relaxations: (1) some rigs co-locate joints (Neck/Head at the same pivot),
+    so Lcl Y near zero is fine, (2) FBX export floating-point precision can
+    push these tiny offsets slightly negative. We use a tolerance so only
+    genuine inversions (Lcl Y < -5cm) are flagged.
 
-    Implementation: check each consecutive kept pair in spine_chain. The
-    child's Lcl Translation Y must be > 0 (it's offset upward from its parent).
+    Severity is "warning" — a slightly-off spine is suspicious but not a
+    blocker. Hard-failing on this caused trouble in real Booth clothing where
+    the Neck/Head pivot was co-located.
     """
     out: list[Violation] = []
     kept = decisions.kept_by_role()
@@ -200,13 +213,14 @@ def rule_monotonic_spine_y(
         child_bone = view.bones.get(kept[child_role][0])
         if child_bone is None:
             continue
-        if child_bone.translation_xyz[1] <= 0:
+        if child_bone.translation_xyz[1] < _SPINE_ASCENT_TOLERANCE:
             out.append(Violation(
-                severity="error",
+                severity="warning",
                 rule="monotonic_spine_y",
                 message=(
                     f"{child_role}'s Lcl Y is {child_bone.translation_xyz[1]:.4f}, "
-                    f"expected > 0 (spine should ascend)"
+                    f"expected > {_SPINE_ASCENT_TOLERANCE} (spine should ascend "
+                    f"or stay near-zero for co-located pivots)"
                 ),
                 bone_ids=[child_bone.model_id],
             ))
