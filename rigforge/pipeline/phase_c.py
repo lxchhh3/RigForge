@@ -285,57 +285,37 @@ def _run_merge(
     if drop_mesh_ids:
         notes.append(f"drop_meshes: removed {len(drop_mesh_ids)} clothing meshes")
 
-    # Materials + BlendShapes dedup. Donor entities whose `name` collides with
-    # the target are stripped from the clothing side; their donor ids land in
-    # the repoint table so id_offset_edits rewrites surviving clothing
-    # connections (e.g. Geometry→Material, BlendShape→Geometry) to point at
-    # the target's already-present equivalents.
-    #
-    # Runs BEFORE per-channel user edits so we know which clothing channels
-    # are about to vanish via dedup — user drops/overrides on those would
-    # produce overlapping edits with the dedup drop_node_edit.
+    # Material dedup. Donor materials whose `name` collides with the target
+    # are stripped from the clothing side; their donor ids land in the
+    # repoint table so id_offset_edits rewrites surviving clothing
+    # connections (e.g. Geometry→Material) to point at the target's
+    # already-present equivalents. Materials are geometry-independent so this
+    # is safe — see _compute_dedup_repoint for why blendshapes are NOT deduped
+    # this way.
     dedup_strip, dedup_repoint = _compute_dedup_repoint(
         donor=clothing_view, target=target_view, notes=notes
     )
     strip_edits.extend(dedup_strip)
     repoint_table.update(dedup_repoint)
-    # Donor channel ids that dedup will strip — used to silence redundant
-    # user drops + skip overrides on doomed channels.
-    dedup_stripped_channels = {
-        cid for cid in dedup_repoint if cid in clothing_view.blend_shape_channels
-    }
 
     # Apply user channel drops on the clothing side. Each channel is dropped
     # independently — its owning BlendShape Deformer survives (it may own
-    # other channels we're keeping). Skip channels already covered by dedup
-    # (the drop edit would overlap the dedup drop_node_edit).
-    user_channel_drops_applied = 0
+    # other channels we're keeping).
     for cid in drop_blend_shape_channel_ids:
-        if cid in dedup_stripped_channels:
-            continue
         strip_edits.extend(drop_blend_shape_channel_edits(clothing_view, cid))
-        user_channel_drops_applied += 1
     if drop_blend_shape_channel_ids:
         notes.append(
             f"drop_blend_shape_channels: removed "
-            f"{user_channel_drops_applied} clothing channels "
-            f"({len(drop_blend_shape_channel_ids) - user_channel_drops_applied} "
-            f"already covered by name-dedup)"
+            f"{len(drop_blend_shape_channel_ids)} clothing channels"
         )
 
     # Apply DeformPercent overrides on the clothing side. Skip channels in
-    # (a) the drop set — the node is about to vanish; or (b) already being
-    # dedup-stripped — overriding a node that's about to be deleted causes
-    # overlapping edits. If the modder wants those channels' values changed,
-    # they should target the target's copy via target_blend_shape_channel_overrides.
+    # the drop set — the node is about to vanish; overriding a doomed node
+    # would produce overlapping edits.
     if blend_shape_channel_overrides:
         applied = 0
-        skipped_dedup = 0
         for cid, pct in blend_shape_channel_overrides.items():
             if cid in drop_blend_shape_channel_ids:
-                continue
-            if cid in dedup_stripped_channels:
-                skipped_dedup += 1
                 continue
             channel_edits = set_blend_shape_channel_deform_percent_edits(
                 clothing_view, cid, pct,
@@ -346,11 +326,6 @@ def _run_merge(
         if applied:
             notes.append(
                 f"override: set DeformPercent on {applied} clothing channels"
-            )
-        if skipped_dedup:
-            notes.append(
-                f"override: skipped {skipped_dedup} overrides on dedup-stripped "
-                f"clothing channels (use target_blend_shape_channel_overrides instead)"
             )
 
     strip_edits = _dedupe_edits(strip_edits)
@@ -521,33 +496,20 @@ def _compute_dedup_repoint(
     if mat_hits:
         notes.append(f"dedup: dropped {mat_hits} donor materials colliding with target")
 
-    # BlendShape Deformer owners by short name.
-    target_bs_by_name: dict[str, int] = {b.name: bid for bid, b in target.blend_shapes.items()}
-    bs_hits = 0
-    for bid, bs in donor.blend_shapes.items():
-        tid = target_bs_by_name.get(bs.name)
-        if tid is None:
-            continue
-        strip_edits.append(drop_node_edit(bs.node_ref, source))
-        repoint[bid] = tid
-        bs_hits += 1
-    if bs_hits:
-        notes.append(f"dedup: dropped {bs_hits} donor BlendShape owners colliding with target")
-
-    # BlendShape channels by short name.
-    target_ch_by_name: dict[str, int] = {
-        c.name: cid for cid, c in target.blend_shape_channels.items()
-    }
-    ch_hits = 0
-    for cid, ch in donor.blend_shape_channels.items():
-        tid = target_ch_by_name.get(ch.name)
-        if tid is None:
-            continue
-        strip_edits.append(drop_node_edit(ch.node_ref, source))
-        repoint[cid] = tid
-        ch_hits += 1
-    if ch_hits:
-        notes.append(f"dedup: dropped {ch_hits} donor BlendShape channels colliding with target")
+    # BlendShape deformers and channels are deliberately NOT deduped by name.
+    # A BlendShape deformer is tied to a specific Geometry (it deforms that
+    # mesh's vertices via per-index displacements). Donor's "BlendShape" on
+    # the donor's Body mesh and target's "BlendShape" on the target's Body
+    # mesh are different objects even when same-named — their indices reference
+    # different vertex layouts. Conflating them by name produced two distinct
+    # Blender import failures:
+    #   (a) one target channel ending up with multiple shape geoms attached
+    #       → "FBX in-between Shapes are not currently supported"
+    #   (b) donor shape geom indices interpreted against target's vertex count
+    #       → "IndexError: index N out of bounds for axis 0 with size M"
+    # Letting each mesh keep its own blendshape graph fixes both. If the modder
+    # wants to remove a redundant clothing mesh (and its morphs), they drop it
+    # via the FE mesh-picker — drop_mesh_edits cascades the cleanup.
 
     return strip_edits, repoint
 

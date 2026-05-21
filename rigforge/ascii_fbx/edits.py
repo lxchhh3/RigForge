@@ -196,7 +196,7 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
     bs_ids: set[int] = set()
     channel_ids: set[int] = set()
     shape_geom_ids: set[int] = set()
-    oo_rows = list(_iter_oo_connections(view))
+    oo_rows = list(iter_oo_connections(view))
     for s, d in oo_rows:
         if d in geom_ids and s in view.blend_shapes:
             bs_ids.add(s)
@@ -242,7 +242,7 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
     return edits
 
 
-def _iter_oo_connections(view: SectionView):
+def iter_oo_connections(view: SectionView):
     """Yield (src_id, dst_id) for every `C: "OO", src, dst` row in Connections.
 
     Skips rows that don't have two numeric ids after the relation tag.

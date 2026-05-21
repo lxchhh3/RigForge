@@ -725,38 +725,29 @@ def test_phase_c_passthrough_handles_stale_target_drop_ids(
 def test_phase_c_passthrough_drops_clothing_blend_shape_channels(
     maya_fbx_ascii: Path, registry,
 ):
-    """When the clothing's channel id is in the drop set BUT the same
-    channel name also exists in the target (so dedup will strip it anyway),
-    the user-drop is silently absorbed by dedup. The merge succeeds; the
-    note reports how many user drops were redundant."""
+    """User-driven channel drop on the clothing side strips that channel
+    node + its connections. We no longer dedup blendshapes by name (each
+    mesh owns its own deformer + channels — see _compute_dedup_repoint), so
+    the drop lands as a plain strip with no collapse-into-dedup behavior."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     ch = next(iter(view.blend_shape_channels.values()))
     plan = EditPlan()
-    # In the maya-on-maya test fixture every channel name collides with
-    # target → dedup strips clothing's copy. The user-drop on this id
-    # collapses into the dedup strip.
     result = run_phase_c(
         clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
         registry=registry, edit_plan=plan,
         drop_blend_shape_channel_ids={ch.channel_id},
     )
-    # Re-parses (no overlapping-edit crash)
-    extract(parse(result.merged_ascii))
-    # Note explains the redundancy
-    assert any("already covered by name-dedup" in n for n in result.notes)
+    extract(parse(result.merged_ascii))  # re-parses cleanly
+    assert any("drop_blend_shape_channels: removed" in n for n in result.notes)
 
 
 def test_phase_c_passthrough_applies_clothing_deform_percent_override(
     maya_fbx_ascii: Path, registry,
 ):
-    """In merge-based pass-through, an override on a clothing channel that
-    name-collides with the target is silently skipped (the channel is being
-    dedup-stripped before override would apply). Note records the skip so
-    the modder can see why their edit didn't land — the right thing to do
-    is use target_blend_shape_channel_overrides for that channel id instead.
-    A FBX with non-overlapping clothing channels would land the override,
-    but the maya-on-maya test fixture is fully overlapping by construction."""
+    """An override on a clothing channel writes the new DeformPercent value
+    into the clothing's copy of that channel before splice. We no longer
+    dedup by name, so the value lands in the merged ASCII verbatim."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     ch = next(iter(view.blend_shape_channels.values()))
@@ -766,12 +757,9 @@ def test_phase_c_passthrough_applies_clothing_deform_percent_override(
         registry=registry, edit_plan=plan,
         blend_shape_channel_overrides={ch.channel_id: 42.5},
     )
-    # Re-parses cleanly (no overlapping-edit crash)
-    extract(parse(result.merged_ascii))
-    # The override didn't land — value not in output
-    assert b"DeformPercent: 42.5" not in result.merged_ascii
-    # Note explains why
-    assert any("dedup-stripped" in n for n in result.notes)
+    extract(parse(result.merged_ascii))  # re-parses cleanly
+    assert b"DeformPercent: 42.5" in result.merged_ascii
+    assert any("override: set DeformPercent on" in n for n in result.notes)
 
 
 def test_phase_c_passthrough_override_skipped_when_channel_dropped(
@@ -943,11 +931,14 @@ def test_phase_c_cross_avatar_dedups_materials_by_name(
         assert name in merged_mat_names
 
 
-def test_phase_c_cross_avatar_dedups_blendshape_channels_by_name(
+def test_phase_c_cross_avatar_preserves_blendshape_channels_per_mesh(
     maya_fbx_ascii: Path, registry,
 ):
-    """Same dedup logic for BlendShapeChannel SubDeformers. Maya + Moe share
-    ~100 channels (e.g. '평면.001'); each must survive once."""
+    """Blendshape channels are NOT deduped by name across meshes. A donor's
+    "Smile" channel on its Body mesh deforms a different vertex set than
+    target's "Smile" on its Body mesh — conflating them by name produces
+    either in-between Shape errors or vertex-index out-of-bounds when the
+    output is imported into Blender. Each mesh keeps its own channels."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
 
@@ -968,7 +959,7 @@ def test_phase_c_cross_avatar_dedups_blendshape_channels_by_name(
         else:
             bones.append(Decision(model_id=b.model_id,
                                    role=f"Secondary.{b.name}", verdict="keep"))
-    decisions = DecisionSet(bones=bones, llm_model_id="test-dedup-channels")
+    decisions = DecisionSet(bones=bones, llm_model_id="test-blendshape-passthrough")
 
     result = run_phase_c(
         clothing_ascii=raw,
@@ -983,22 +974,22 @@ def test_phase_c_cross_avatar_dedups_blendshape_channels_by_name(
     target_ascii = moe.load_ascii_bytes()
     extract(parse(merged))  # structural sanity
 
-    # Spot-check: every shared channel's count in the merged ASCII must match
-    # the target's pre-merge count (donor copies dropped). FBX allows multiple
-    # channels with the same short name across different BlendShape Deformers,
-    # so we compare counts rather than asserting exactly 1.
+    # Every shared-name channel's merged count is target_count + donor_count —
+    # both sides survive because we don't dedup blendshapes by name anymore.
     sample = sorted(shared)[:10]
     for name in sample:
         needle = f'"SubDeformer::{name}"'.encode("utf-8")
         merged_count = merged.count(needle)
         target_count = target_ascii.count(needle)
-        assert merged_count == target_count, (
-            f"expected {target_count} SubDeformer::{name} after dedup, "
+        donor_count = raw.count(needle)
+        assert merged_count == target_count + donor_count, (
+            f"expected {target_count} (target) + {donor_count} (donor) = "
+            f"{target_count + donor_count} SubDeformer::{name} in merged, "
             f"got {merged_count}"
         )
 
-    assert any("dedup: dropped" in n and "channels" in n for n in result.notes), (
-        f"expected a channel dedup note, got: {result.notes}"
+    assert not any("dedup: dropped" in n and "channels" in n for n in result.notes), (
+        f"channels must not be deduped; got: {result.notes}"
     )
 
 
