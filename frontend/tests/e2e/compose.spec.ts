@@ -23,9 +23,12 @@ const INSPECT_TREE = {
     { model_id: 13, name: 'Skirt', type_class: 'Mesh', parent_id: null, subtree_size: 1, cluster_weight_count: 0, deforms_meshes: [] },
   ],
   blend_shape_channels: [
-    { channel_id: 901, name: 'Smile', owner_id: 800, owner_name: 'Face', deform_percent: 0 },
-    { channel_id: 902, name: 'Wink', owner_id: 800, owner_name: 'Face', deform_percent: 0 },
-    { channel_id: 903, name: 'CapeBillow', owner_id: 801, owner_name: 'Cape', deform_percent: 0 },
+    { channel_id: 901, name: 'Smile', owner_id: 800, owner_name: 'Face', owner_mesh: 'Body', deform_percent: 0 },
+    { channel_id: 902, name: 'Wink', owner_id: 800, owner_name: 'Face', owner_mesh: 'Body', deform_percent: 0 },
+    { channel_id: 903, name: 'CapeBillow', owner_id: 801, owner_name: 'Cape', owner_mesh: 'Body', deform_percent: 0 },
+    // Duplicate channel NAME across two meshes — only owner_mesh tells them apart.
+    { channel_id: 910, name: 'High heeled', owner_id: 820, owner_name: 'morph', owner_mesh: 'C_Shoes', deform_percent: 0 },
+    { channel_id: 911, name: 'High heeled', owner_id: 821, owner_name: 'morph', owner_mesh: 'B_Socks', deform_percent: 0 },
   ],
 }
 
@@ -415,4 +418,94 @@ test('history route still shows the recent runs panel', async ({ page }) => {
   await mockApi(page)
   await page.goto('/history')
   await expect(page.getByTestId('recent-assemblies')).toBeVisible()
+})
+
+test('duplicate-named blendshapes are disambiguated by owning mesh, and the slider targets the right channel', async ({ page }) => {
+  // The 6/16 bug: two "High heeled" channels (C_Shoes + B_Socks) were
+  // indistinguishable in the UI, so the override landed on the wrong one.
+  await mockApi(page)
+  const assembleRequests: unknown[] = []
+  await captureAssembleRequests(page, assembleRequests)
+  await page.goto('/')
+
+  await page.getByTestId('clothing-path-input').fill('C:/fixtures/classic_chic.fbx')
+  await page.getByTestId('clothing-add-button').click()
+  const clothing = page.getByTestId('clothing-item').first()
+
+  // Both "High heeled" rows exist and each shows its owning mesh.
+  const heels = clothing.locator('[data-channel-name="High heeled"]')
+  await expect(heels).toHaveCount(2)
+  const cShoes = clothing.locator('[data-channel-name="High heeled"][data-owner-mesh="C_Shoes"]')
+  const bSocks = clothing.locator('[data-channel-name="High heeled"][data-owner-mesh="B_Socks"]')
+  await expect(cShoes.getByTestId('blendshape-owner-mesh')).toHaveText('C_Shoes')
+  await expect(bSocks.getByTestId('blendshape-owner-mesh')).toHaveText('B_Socks')
+
+  // Move ONLY the C_Shoes one to 62.
+  await cShoes.locator('input[type=range]').fill('62')
+
+  await page.getByTestId('assemble-button').click()
+  await expect(page.getByTestId('assemble-result').first()).toBeVisible()
+
+  const body = assembleRequests[0] as {
+    blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
+  }
+  // Exactly the C_Shoes channel (910), not the B_Socks one (911).
+  expect(body.blend_shape_channel_overrides).toEqual([
+    { channel_id: 910, deform_percent: 62 },
+  ])
+})
+
+test('target (base avatar) blendshape override survives a page reload', async ({ page }) => {
+  // User report: base-avatar modifications vanish on refresh/BE restart.
+  await mockApi(page)
+  await page.goto('/')
+
+  const targetPanel = page.getByTestId('target-panel')
+  const smile = targetPanel.locator('[data-channel-name="TargetSmile"]')
+  await smile.locator('input[type=range]').fill('75')
+  await expect(smile.getByTestId('blendshape-value')).toHaveText('75')
+
+  await page.reload()
+
+  const smileAfter = page.getByTestId('target-panel').locator('[data-channel-name="TargetSmile"]')
+  await expect(smileAfter).toBeVisible()
+  await expect(smileAfter.getByTestId('blendshape-value')).toHaveText('75')
+})
+
+test('FE drops survive a page reload (localStorage persistence)', async ({ page }) => {
+  // The modder's deselections must not vanish on reload / app reopen. Paired
+  // with the backend's deterministic bin->ASCII cache, the persisted ids still
+  // resolve to the same meshes after a BE restart.
+  await mockApi(page)
+  await page.goto('/')
+
+  // Strip a target mesh (Cloth, model_id 202).
+  const targetPanel = page.getByTestId('target-panel')
+  await targetPanel.locator('[data-mesh-name="Cloth"] input[type=checkbox]').uncheck()
+  await expect(targetPanel.locator('[data-mesh-name="Cloth"]')).toHaveAttribute('data-state', 'dropped')
+
+  // Add a clothing and drop its Skirt (model_id 13).
+  await page.getByTestId('clothing-path-input').fill('C:/fixtures/classic_chic.fbx')
+  await page.getByTestId('clothing-add-button').click()
+  const skirt = page.locator('[data-testid="clothing-item"] [data-mesh-name="Skirt"]')
+  await expect(skirt).toBeVisible()
+  await skirt.locator('input[type=checkbox]').uncheck()
+  await expect(skirt).toHaveAttribute('data-state', 'dropped')
+
+  // Reload — equivalent to reopening the app. State restores from localStorage,
+  // then re-inspects to repaint.
+  await page.reload()
+
+  // Clothing reappears with its drop preserved; a non-dropped sibling stays kept.
+  const skirtAfter = page.locator('[data-testid="clothing-item"] [data-mesh-name="Skirt"]')
+  await expect(skirtAfter).toBeVisible()
+  await expect(skirtAfter).toHaveAttribute('data-state', 'dropped')
+  await expect(page.locator('[data-testid="clothing-item"] [data-mesh-name="Body"]'))
+    .toHaveAttribute('data-state', 'kept')
+
+  // Target strip preserved too.
+  await expect(page.getByTestId('target-panel').locator('[data-mesh-name="Cloth"]'))
+    .toHaveAttribute('data-state', 'dropped')
+  await expect(page.getByTestId('target-panel').locator('[data-mesh-name="Shoes"]'))
+    .toHaveAttribute('data-state', 'kept')
 })

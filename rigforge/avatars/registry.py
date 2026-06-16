@@ -202,12 +202,23 @@ def identify_donor(
     clothing_bone_names: Iterable[str],
     registry: AvatarRegistry,
     *,
+    target_id: Optional[str] = None,
     threshold: float = DEFAULT_DONOR_THRESHOLD,
 ) -> tuple[str, float, list[tuple[str, float]]]:
     """Phase A: pick the curated donor that best matches `clothing_bone_names`.
 
     Returns (donor_id, score, ranked_candidates). Raises DonorIdentificationError
     if the top score < threshold.
+
+    `target_id` (the avatar the clothing is being assembled ONTO) gets first
+    refusal: when the target is itself a viable match (score ≥ threshold) we use
+    it as the donor so Phase C takes the reliable NAME-BASED merge. The coverage
+    scorer favors whichever curated avatar has the larger fingerprint, so a
+    target-adapted clothing can lose by a single coincidental bone (e.g. a skirt
+    dynamics bone the bigger avatar happens to carry) and get dragged onto the
+    cross-avatar (LLM + decision-cache) path it doesn't need. We only fall
+    through to the best cross-avatar candidate when the target genuinely doesn't
+    fit.
     """
     clothing_fp = fingerprint(clothing_bone_names)
     # Clothing→avatar uses containment + uniqueness; Jaccard would
@@ -217,6 +228,10 @@ def identify_donor(
         raise DonorIdentificationError(
             "no curated avatars in registry", top_candidates=[]
         )
+    if target_id is not None:
+        target_score = next((s for cid, s in ranked if cid == target_id), None)
+        if target_score is not None and target_score >= threshold:
+            return (target_id, target_score, ranked)
     top_id, top_score = ranked[0]
     if top_score < threshold:
         raise DonorIdentificationError(

@@ -373,7 +373,7 @@ def test_inspect_returns_blend_shape_channels(
     client: TestClient, maya_fbx_ascii: Path,
 ):
     """Inspect must surface the channel list so the FE can render checkboxes.
-    Each item has channel_id + name + owner_id + owner_name."""
+    Each item has channel_id + name + owner_id + owner_name + owner_mesh."""
     r = client.post("/api/clothings/inspect", json={"path": str(maya_fbx_ascii)})
     assert r.status_code == 200, r.text
     payload = r.json()
@@ -381,12 +381,14 @@ def test_inspect_returns_blend_shape_channels(
     assert isinstance(channels, list)
     assert channels, "expected at least one channel in Maya.fbx"
     sample = channels[0]
-    assert set(sample.keys()) >= {"channel_id", "name", "owner_id", "owner_name"}
-    # Sorted by (name, channel_id) — FE renders the flat list as-is
-    names = [c["name"] for c in channels]
-    assert names == sorted(names) or all(
-        names[i] <= names[i + 1] for i in range(len(names) - 1)
-    )
+    assert set(sample.keys()) >= {
+        "channel_id", "name", "owner_id", "owner_name", "owner_mesh",
+    }
+    # Sorted by (owner_mesh, name, channel_id) — grouped by owning mesh so
+    # duplicate channel names (several meshes share e.g. "High heeled") are
+    # distinguishable in the FE.
+    keys = [(c.get("owner_mesh") or "", c["name"], c["channel_id"]) for c in channels]
+    assert keys == sorted(keys)
 
 
 def test_avatar_inspect_returns_blend_shape_channels(client: TestClient):

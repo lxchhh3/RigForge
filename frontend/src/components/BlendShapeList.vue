@@ -74,12 +74,14 @@ function onSlide(c: InspectedChannel, e: Event) {
     <ul class="bs-list">
       <li v-for="c in channels" :key="c.channel_id" class="bs-row"
           data-testid="blendshape-row" :data-channel-id="c.channel_id"
-          :data-channel-name="c.name"
+          :data-channel-name="c.name" :data-owner-mesh="c.owner_mesh ?? ''"
           :data-state="isDropped(c.channel_id) ? 'dropped' : 'kept'"
           :data-has-override="hasOverride(c) ? '1' : '0'">
         <input type="checkbox" :checked="!isDropped(c.channel_id)"
                @change="onToggle(c, $event)" />
         <span class="icon">◈</span>
+        <span v-if="c.owner_mesh" class="mesh" data-testid="blendshape-owner-mesh"
+              :title="`mesh: ${c.owner_mesh}`">{{ c.owner_mesh }}</span>
         <span class="name">{{ c.name }}</span>
         <span v-if="c.owner_name" class="meta">{{ c.owner_name }}</span>
         <input
@@ -142,6 +144,18 @@ function onSlide(c: InspectedChannel, e: Event) {
   color: #888;
   width: 1rem;
   text-align: center;
+}
+.bs-row .mesh {
+  color: #8ab;
+  background: #1c2530;
+  border: 1px solid #2a3a48;
+  border-radius: 3px;
+  padding: 0 0.35rem;
+  font-size: 0.7rem;
+  max-width: 8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .bs-row .meta {
   color: #666;

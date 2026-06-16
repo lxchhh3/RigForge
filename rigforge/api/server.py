@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from rigforge.ascii_fbx.convert import bin_to_ascii
+from rigforge.ascii_fbx.convert import bin_to_ascii_cached
 from rigforge.ascii_fbx.lexer import parse as parse_fbx
 from rigforge.ascii_fbx.sections import (
     SectionView,
@@ -44,8 +44,6 @@ _MANIFEST_SUFFIX = ".manifest.json"
 # Filename stems are user-derived but constrained: alnum, dash, underscore.
 # Anything else (slashes, dots, percent escapes) is rejected before disk I/O.
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")
-# Binary FBX magic — first 21 bytes of every binary FBX (Autodesk format).
-_FBX_BINARY_MAGIC = b"Kaydara FBX Binary  \x00"
 
 
 class InspectRequest(BaseModel):
@@ -126,6 +124,23 @@ def _build_inspect_response(
     bs_owners = view.blend_shapes
     source = view.document.source
 
+    # Channel -> owning MESH name. Blendshape channel names are routinely
+    # duplicated across meshes (e.g. several "High heeled" / "Big breasts"),
+    # so the mesh is the only thing that disambiguates them in the FE. Walk
+    # BlendShape -> Geometry -> Mesh-Model once.
+    from rigforge.ascii_fbx.edits import iter_oo_connections
+    _bs_to_geo = {
+        s: d for s, d in iter_oo_connections(view)
+        if s in view.blend_shapes and d in view.geometries
+    }
+    _mesh_name_by_model = {
+        b.model_id: b.name for b in view.bones.values() if b.type_class == "Mesh"
+    }
+
+    def _owner_mesh(ch):
+        geo = _bs_to_geo.get(ch.blend_shape_id)
+        return _mesh_name_by_model.get(view.geometry_owner_model.get(geo))
+
     def _read_deform_percent(ch) -> float:
         # Read the on-disk DeformPercent so the FE slider starts at the
         # file's actual value (typically 0). Channels without the property
@@ -151,11 +166,15 @@ def _build_inspect_response(
                 bs_owners[ch.blend_shape_id].name
                 if ch.blend_shape_id in bs_owners else None
             ),
+            # The mesh this morph deforms — disambiguates duplicate channel names.
+            "owner_mesh": _owner_mesh(ch),
             "deform_percent": _read_deform_percent(ch),
         }
+        # Group by owning mesh, then name, so duplicate-named channels sit under
+        # their mesh instead of being interleaved and indistinguishable.
         for ch in sorted(
             view.blend_shape_channels.values(),
-            key=lambda c: (c.name, c.channel_id),
+            key=lambda c: (_owner_mesh(c) or "", c.name, c.channel_id),
         )
     ]
     return {
@@ -255,16 +274,15 @@ def create_app(
         if not p.is_file():
             raise HTTPException(status_code=404, detail=f"file not found: {req.path}")
         try:
-            raw = p.read_bytes()
-            if raw.startswith(_FBX_BINARY_MAGIC):
-                # Binary FBX — round-trip through fbx_env converter to get ASCII.
-                # Cached under output_dir so subsequent inspects of the same path
-                # are cheap (the converter subprocess is the slow part).
-                ascii_cache = output_dir / "_inspect_cache" / f"{p.stem}_ascii.fbx"
-                ascii_cache.parent.mkdir(parents=True, exist_ok=True)
-                if not ascii_cache.is_file() or ascii_cache.stat().st_mtime < p.stat().st_mtime:
-                    bin_to_ascii(p, ascii_cache)
-                raw = ascii_cache.read_bytes()
+            # Convert through the SHARED bin→ASCII cache. The assemble pipeline
+            # (Phase A) reads the same cache dir, so a binary clothing converts
+            # exactly once and the ids the FE reads here are the same ids the
+            # pipeline drops against. Without this, two independent conversions
+            # mint different (pointer-derived) ids and every clothing-side drop
+            # the FE sends back is a silent no-op. An ASCII input is returned
+            # as-is by the helper.
+            ascii_path = bin_to_ascii_cached(p, output_dir / "_fbx_ascii_cache")
+            raw = ascii_path.read_bytes()
             doc = parse_fbx(raw)
             view = extract_sections(doc)
         except HTTPException:
@@ -353,6 +371,9 @@ def create_app(
         )
 
         kwargs = {
+            # Same cache dir the inspect endpoint uses — keeps the FE's part
+            # ids aligned with Phase A's view (one shared bin→ASCII conversion).
+            "ascii_cache_dir": output_dir / "_fbx_ascii_cache",
             "user_drop_bone_ids": drop_ids,
             "target_drop_bone_ids": target_drop_ids,
             "drop_mesh_ids": drop_mesh,

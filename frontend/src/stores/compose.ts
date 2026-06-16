@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { reactive, ref } from 'vue'
+import { reactive, ref, watch } from 'vue'
 
 export interface InspectedBone {
   model_id: number
@@ -18,6 +18,9 @@ export interface InspectedChannel {
   name: string
   owner_id: number | null
   owner_name: string | null
+  // The mesh this morph deforms. Disambiguates duplicate channel names (several
+  // meshes can each carry a "High heeled" / "Big breasts" channel).
+  owner_mesh?: string | null
   // On-disk DeformPercent (0-100, typically 0). The slider starts here so
   // the user sees the file's actual baseline expression value.
   deform_percent: number
@@ -97,6 +100,24 @@ export const ASSEMBLE_PHASES: AssemblePhase[] = ['phase_a', 'phase_b', 'phase_c'
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? 'http://localhost:8000').replace(/\/$/, '')
 
+// localStorage key for the compose session. Bump the suffix if the persisted
+// shape ever changes incompatibly.
+const PERSIST_KEY = 'rigforge.compose.v1'
+
+// The lean, JSON-serializable form of a per-source selection. inspect payloads
+// are NOT stored — they're re-fetched on hydrate (cheap, and the backend's
+// content-addressed conversion cache means a re-inspect returns the SAME ids).
+interface PersistedSelection {
+  droppedRoots: number[]
+  droppedChannels: number[]
+  channelOverrides: [number, number][]
+}
+interface PersistedSnapshot {
+  targetId: string | null
+  target: ({ avatarId: string | null } & PersistedSelection) | null
+  clothings: ({ path: string } & PersistedSelection)[]
+}
+
 export const useComposeStore = defineStore('compose', () => {
   const targetId = ref<string | null>(null)
   const clothings = reactive<ComposedClothing[]>([])
@@ -114,6 +135,13 @@ export const useComposeStore = defineStore('compose', () => {
     droppedChannels: new Set(),
     channelOverrides: new Map(),
   })
+
+  // Set by _hydrate(); consumed by the next loadTargetInspect for the matching
+  // avatar so a restored target-strip survives the inspect reset. One-shot.
+  let pendingTargetRestore: ({ avatarId: string } & PersistedSelection) | null = null
+  // While true, persistence writes are suppressed so the initial restore can't
+  // overwrite the saved snapshot with half-built state.
+  let hydrating = false
 
   async function loadTargetInspect(avatarId: string): Promise<void> {
     target.avatarId = avatarId
@@ -134,6 +162,15 @@ export const useComposeStore = defineStore('compose', () => {
         throw new Error(detail)
       }
       target.inspect = (await res.json()) as InspectedClothing
+      // Re-apply a restored target strip for this avatar (survives reload). The
+      // reset above cleared the sets; put the persisted ones back now that the
+      // tree is loaded.
+      if (pendingTargetRestore && pendingTargetRestore.avatarId === avatarId) {
+        target.droppedRoots = new Set(pendingTargetRestore.droppedRoots)
+        target.droppedChannels = new Set(pendingTargetRestore.droppedChannels)
+        target.channelOverrides = new Map(pendingTargetRestore.channelOverrides)
+        pendingTargetRestore = null
+      }
     } catch (e) {
       target.error = e instanceof Error ? e.message : String(e)
     } finally {
@@ -343,6 +380,85 @@ export const useComposeStore = defineStore('compose', () => {
       assembling.value = false
     }
   }
+
+  // --- persistence (survive reload / app reopen) -------------------------
+  // We persist only the user's selections (drops + overrides), never the heavy
+  // inspect payloads — those are re-fetched on hydrate. Pairs with the backend
+  // bin->ASCII cache: a re-inspect of the same clothing returns the same ids,
+  // so persisted ids still line up after a BE restart.
+
+  function snapshot(): PersistedSnapshot {
+    return {
+      targetId: targetId.value,
+      target: target.avatarId
+        ? {
+            avatarId: target.avatarId,
+            droppedRoots: [...target.droppedRoots],
+            droppedChannels: [...target.droppedChannels],
+            channelOverrides: [...target.channelOverrides.entries()],
+          }
+        : null,
+      clothings: clothings.map((c) => ({
+        path: c.path,
+        droppedRoots: [...c.droppedRoots],
+        droppedChannels: [...c.droppedChannels],
+        channelOverrides: [...c.channelOverrides.entries()],
+      })),
+    }
+  }
+
+  function persist(): void {
+    if (hydrating) return
+    if (typeof localStorage === 'undefined') return
+    try {
+      localStorage.setItem(PERSIST_KEY, JSON.stringify(snapshot()))
+    } catch {
+      /* quota / private-mode — persistence is best-effort, never fatal */
+    }
+  }
+
+  function hydrate(): void {
+    if (typeof localStorage === 'undefined') return
+    let snap: PersistedSnapshot | null = null
+    try {
+      const raw = localStorage.getItem(PERSIST_KEY)
+      snap = raw ? (JSON.parse(raw) as PersistedSnapshot) : null
+    } catch {
+      snap = null
+    }
+    if (!snap) return
+
+    hydrating = true
+    // Restore the picked target + queue its strip for the upcoming inspect.
+    if (snap.targetId) targetId.value = snap.targetId
+    if (snap.target?.avatarId) {
+      pendingTargetRestore = {
+        avatarId: snap.target.avatarId,
+        droppedRoots: snap.target.droppedRoots ?? [],
+        droppedChannels: snap.target.droppedChannels ?? [],
+        channelOverrides: snap.target.channelOverrides ?? [],
+      }
+    }
+    // Restore clothings WITH their selections, then (re-)inspect to repaint.
+    for (const cs of snap.clothings ?? []) {
+      clothings.push({
+        path: cs.path,
+        loading: true,
+        error: null,
+        inspect: null,
+        droppedRoots: new Set(cs.droppedRoots ?? []),
+        droppedChannels: new Set(cs.droppedChannels ?? []),
+        channelOverrides: new Map(cs.channelOverrides ?? []),
+      })
+      inspect(clothings[clothings.length - 1])
+    }
+    hydrating = false
+  }
+
+  hydrate()
+  // Deep-watch the selection-bearing state; serialize on any change. inspect
+  // payloads aren't in the snapshot, so inspect resolutions don't churn writes.
+  watch([targetId, target, clothings], persist, { deep: true })
 
   return {
     targetId,

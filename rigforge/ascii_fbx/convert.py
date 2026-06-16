@@ -138,6 +138,54 @@ def bin_to_ascii(
     return dst
 
 
+def _ascii_cache_key(src: Path) -> str:
+    """Short, stable key identifying a source FBX by (resolved path, size,
+    mtime). Cheap — no full-content read. If the file is edited the size or
+    mtime changes, so the key changes and we reconvert."""
+    import hashlib
+
+    st = src.stat()
+    raw = f"{src}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def bin_to_ascii_cached(
+    src: Path,
+    cache_dir: Path,
+    *,
+    config: Optional[ConverterConfig] = None,
+) -> Path:
+    """Return the ASCII form of `src`, converting through a shared, on-disk,
+    content-addressed cache so repeated calls for the same source return the
+    SAME ASCII file (and therefore the same FBX node ids).
+
+    Why this exists: the FBX SDK derives node ids from memory pointers, so two
+    independent `bin_to_ascii` runs over one clothing file disagree on every
+    model_id. The FE outliner (inspect) and the pipeline (Phase A) both need
+    those ids to line up — otherwise every clothing-side drop the FE sends is a
+    silent no-op. Routing both through this one cache guarantees they see
+    identical ids, within a run and across a BE restart (the cache is on disk,
+    keyed by source identity).
+
+    An already-ASCII `src` is returned verbatim (no conversion, no cache entry)
+    — both callers then read the original file, so ids already agree.
+    """
+    src = Path(src).resolve()
+    if not src.is_file():
+        raise ConverterError(f"input FBX not found: {src}")
+
+    head = src.read_bytes()[:32]
+    if not head.startswith(b"Kaydara FBX Binary"):
+        return src  # already ASCII — passthrough
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dst = cache_dir / f"{src.stem}.{_ascii_cache_key(src)}_ascii.fbx"
+    if dst.is_file() and dst.stat().st_size > 0:
+        return dst.resolve()
+    return bin_to_ascii(src, dst, config=config)
+
+
 def ascii_to_bin(
     src: Path,
     dst: Path,

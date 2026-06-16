@@ -48,7 +48,7 @@ from rigforge.ascii_fbx.merge import (
     splice_into_section_edit,
     zero_weight_leaf_bone_ids,
 )
-from rigforge.ascii_fbx.sections import SectionView, extract
+from rigforge.ascii_fbx.sections import SectionView, _extract_props_vec3, extract
 from rigforge.avatars.registry import AvatarRegistry, CuratedAvatar
 from rigforge.canonical.decisions import DecisionSet
 
@@ -57,6 +57,40 @@ from .edit_plan import EditPlan
 
 class PhaseCError(RuntimeError):
     pass
+
+
+def _find_target_armature_null(target_view: SectionView) -> Optional[int]:
+    """The target's top-level armature `Null` (the node that wraps its whole
+    skeleton), if any.
+
+    Curated avatars (and clothing) wrap their skeleton in an `Armature` Null
+    carrying `Lcl Rotation (-90, 0, 0)` — the Y-up/Z-up reconciliation. When the
+    clothing's own armature Null is stripped during merge, its surviving children
+    must reparent under THIS node so they inherit the same -90 the avatar's own
+    content has; reparenting them to the identity scene root instead drops the
+    rotation and tilts the clothing 90 degrees.
+
+    Returns the model_id of the target's root Null, preferring one with a
+    non-identity rotation (the orientation we must preserve). None when the
+    target has no top-level Null — then the caller keeps the old scene-root
+    behavior, which already matches such a target.
+    """
+    bone_ids = set(target_view.bones)
+    src = target_view.document.source
+    candidates: list[tuple[int, tuple[float, float, float]]] = []
+    for b in target_view.bones.values():
+        if b.type_class != "Null":
+            continue
+        pid = b.parent_id
+        if pid is None or pid == 0 or pid not in bone_ids:
+            rot = _extract_props_vec3(b.node_ref, src, "Lcl Rotation", (0.0, 0.0, 0.0))
+            candidates.append((b.model_id, rot))
+    if not candidates:
+        return None
+    for mid, rot in candidates:
+        if any(abs(v) > 1e-3 for v in rot):
+            return mid
+    return candidates[0][0]
 
 
 @dataclass
@@ -270,20 +304,43 @@ def _run_merge(
             continue
         strip_edits.extend(drop_bone_edits(clothing_view, bone))
     # Strip clothing's armature root (Type=Null Models). Repoint children
-    # pointing at it to scene RootNode (0) so the surviving sub-tree stays
-    # attached to the scene after the armature root vanishes.
+    # pointing at it to the TARGET's armature Null so the surviving sub-tree
+    # inherits the avatar's root transform (the -90 Y-up/Z-up rotation). The
+    # clothing's own armature carried that -90; reparenting to the identity
+    # scene root instead would tilt the clothing 90 degrees vs the avatar
+    # (see _find_target_armature_null). Falls back to scene RootNode (0) when
+    # the target has no armature Null.
+    armature_dst = _find_target_armature_null(target_view)
+    if armature_dst is None:
+        armature_dst = 0
     for b in clothing_view.bones.values():
         if b.type_class == "Null":
             strip_edits.extend(bone_keep_strip_edits(clothing_view, b))
-            repoint_table[b.model_id] = 0
+            repoint_table[b.model_id] = armature_dst
+    notes.append(
+        f"armature_reparent: clothing armature children -> "
+        f"{'target armature ' + str(armature_dst) if armature_dst else 'scene root 0'}"
+    )
 
     # Apply user mesh drops on the clothing side (e.g., outfit ships with a
     # cape mesh the modder doesn't want). Strips Mesh-Model + Geometry + Skin
     # + Clusters as a unit so no orphan refs survive into the splice.
+    clothing_meshes_removed = 0
     for mid in drop_mesh_ids:
-        strip_edits.extend(drop_mesh_edits(clothing_view, mid))
+        mesh_edits = drop_mesh_edits(clothing_view, mid)
+        if mesh_edits:
+            strip_edits.extend(mesh_edits)
+            clothing_meshes_removed += 1
+        else:
+            # id didn't resolve to a Mesh in this view — the canonical symptom
+            # of an id-source mismatch. Surface it instead of silently counting
+            # it as removed.
+            notes.append(f"skip: drop_mesh id={mid} not a clothing mesh")
     if drop_mesh_ids:
-        notes.append(f"drop_meshes: removed {len(drop_mesh_ids)} clothing meshes")
+        notes.append(
+            f"drop_meshes: removed {clothing_meshes_removed}/{len(drop_mesh_ids)} "
+            f"clothing meshes"
+        )
 
     # Material dedup. Donor materials whose `name` collides with the target
     # are stripped from the clothing side; their donor ids land in the
@@ -370,12 +427,14 @@ def _run_merge(
                 notes.append(f"skip: target_drop bone id={bid} not in target view")
                 continue
             target_drop_edits.extend(drop_bone_edits(target_view, bone))
+        target_meshes_removed = 0
         for mid in target_drop_mesh_ids:
             mesh = target_view.bones.get(mid)
             if mesh is None or mesh.type_class != "Mesh":
                 notes.append(f"skip: target_drop_mesh id={mid} not a target mesh")
                 continue
             target_drop_edits.extend(drop_mesh_edits(target_view, mid))
+            target_meshes_removed += 1
         for cid in target_drop_blend_shape_channel_ids:
             ch = target_view.blend_shape_channels.get(cid)
             if ch is None:
@@ -398,7 +457,7 @@ def _run_merge(
         target_ascii = apply_edits(target_ascii, target_drop_edits)
         notes.append(
             f"target_drop: removed {len(target_drop_bone_ids)} bones + "
-            f"{len(target_drop_mesh_ids)} meshes + "
+            f"{target_meshes_removed}/{len(target_drop_mesh_ids)} meshes + "
             f"{len(target_drop_blend_shape_channel_ids)} channels + "
             f"override {target_override_applied} channels before splice"
         )

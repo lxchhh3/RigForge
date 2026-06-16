@@ -64,6 +64,7 @@ def assemble(
     llm_client: LLMClient,
     cache: Optional[DecisionCache] = None,
     work_dir: Optional[Path] = None,
+    ascii_cache_dir: Optional[Path] = None,
     user_drop_bone_ids: Optional[set[int]] = None,
     target_drop_bone_ids: Optional[set[int]] = None,
     drop_mesh_ids: Optional[set[int]] = None,
@@ -98,10 +99,20 @@ def assemble(
     out_fbx = Path(out_fbx).resolve()
     work_dir = (Path(work_dir).resolve() if work_dir else out_fbx.parent / "_rigforge_work")
     work_dir.mkdir(parents=True, exist_ok=True)
+    # Shared bin→ASCII cache. The API passes the same directory to the inspect
+    # endpoint so the clothing converts once and the FE's part ids match the
+    # pipeline's view. Default keeps it beside the output for the CLI path.
+    ascii_cache_dir = (
+        Path(ascii_cache_dir).resolve() if ascii_cache_dir
+        else out_fbx.parent / "_fbx_ascii_cache"
+    )
 
     _emit("phase_a", f"identifying donor for {clothing_fbx.name}")
     # --- Phase A
-    a = run_phase_a(clothing_fbx, registry, work_dir=work_dir)
+    a = run_phase_a(
+        clothing_fbx, registry, work_dir=work_dir, ascii_cache_dir=ascii_cache_dir,
+        target_id=target_id,
+    )
     _emit("phase_a", f"donor={a.donor_id} score={a.score:.2f}")
 
     _emit("phase_b", f"classifying {len(a.view.limb_bones())} bones (LLM may take minutes)")
