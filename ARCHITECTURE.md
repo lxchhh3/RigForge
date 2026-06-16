@@ -43,13 +43,16 @@ clothing_ascii.fbx (text)
     │           ▼       ▼
     │       re-prompt   EditPlan.from_decisions(...)
     │       (once)        drops   = {bone_id : verdict == "drop"}
-    │                     renames = {bone_id : target_name_for(role)} (if names differ)
+    │                     renames = {bone_id : clean_name_for(role)} (if names differ;
+    │                               canonical→target name, structured secondary→role string)
     │                     reparents = {bone_id : target_bone_id_for(new_parent_role)}
     │
-    ├──► Phase C: apply drops + renames + reparents as text edits on ASCII;
-    │             in cross-avatar, also dedup materials/blendshapes by name,
-    │             apply user mesh/channel drops + DeformPercent overrides,
-    │             splice into target's Objects + Connections.
+    ├──► Phase C: merge onto target. Apply drops; apply renames to the
+    │             ride-along secondary bones (canonical bones are stripped —
+    │             the target owns their names — so those renames + reparents
+    │             are moot); in cross-avatar, also dedup materials/blendshapes
+    │             by name, apply user mesh/channel drops + DeformPercent
+    │             overrides, splice into target's Objects + Connections.
     │
     ▼
 assembled_ascii.fbx
@@ -215,7 +218,7 @@ Error → one re-prompt with violation text appended → second failure raises.
 
 ### v2 (landed)
 
-- **Bone reparenting** — `reparent_bone_edits` in `ascii_fbx/edits.py`; `Decision.new_parent_role` carries the LLM's request; `hierarchy_consistency` validator follows the post-reparent topology; `EditPlan.reparents` resolves `new_parent_role` → bone id; pass-through `_build_passthrough_edits` applies the edits. LLM prompt documents the optional `new_parent_role` field.
+- **Bone reparenting** — `reparent_bone_edits` in `ascii_fbx/edits.py`; `Decision.new_parent_role` carries the LLM's request; `hierarchy_consistency` validator follows the post-reparent topology; `EditPlan.reparents` resolves `new_parent_role` → bone id. Since the always-merge pivot (`324cd02`) the old pass-through `_build_passthrough_edits` path is gone: reparents are moot for name-matched/canonical bones (they're stripped, the target's topology wins) — the same way canonical renames are moot. LLM prompt documents the optional `new_parent_role` field.
 - **Fingers + twist bones in canonical schema** — schema bumped to **v2.1** (cache auto-invalidates because key includes `canonical_schema_version`). 30 finger roles (Thumb/Index/Middle/Ring/Little × 1/2/3 × .L/.R) and 8 twist roles (Upper/LowerArm/Leg.Twist.L/.R), all optional. `finger_count_sanity` validator now checks L/R parity instead of warning on any finger name. `curated_avatars.json` carries finger renames for Maya + Moe.
 - **Materials + blendshapes parsers + merge primitives** — `MaterialRecord` / `BlendShapeRecord` / `BlendShapeChannelRecord` extraction in `sections.py`; `merge_materials` / `merge_blendshapes` with name-keyed dedup in `rigforge/sections/merge.py`. Unit-tested.
 - **Materials/BlendShapes dedup in Phase C cross-merge** — `_compute_dedup_repoint` in `pipeline/phase_c.py` strips donor materials and BlendShape Deformers + channels whose short name collides with the target, and adds donor→target id mappings to `repoint_table` so `id_offset_edits` rewrites surviving clothing-side connections (e.g. Geometry→Material, BlendShape→Geometry) to the target's existing ids. Symmetric with how kept-bone repointing works.
