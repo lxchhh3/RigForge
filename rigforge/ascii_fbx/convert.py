@@ -21,8 +21,13 @@ from pathlib import Path
 from typing import Optional
 
 
+# The fbx_env conda PYTHON stays machine-specific (it carries the FBX SDK
+# bindings). The converter SCRIPTS (fbx_bin2ascii / fbx_ascii2bin / fbx_compare)
+# now live in-repo under fbx_env/ so they're version-controlled — notably the
+# DeformPercent re-apply fix in fbx_ascii2bin.py. Both are overridable via
+# $RIGFORGE_FBX_ENV_PYTHON / $RIGFORGE_FBX_TOOLCHAIN_DIR.
 _DEFAULT_FBX_ENV_PYTHON = Path("D:/2files/env_build/conda/conda/envs/fbx_env/python.exe")
-_DEFAULT_TOOLCHAIN_DIR = Path("D:/2files/models/vrc/Maya/Maya_Ver1.02.2")
+_DEFAULT_TOOLCHAIN_DIR = Path(__file__).resolve().parent.parent.parent / "fbx_env"
 
 ENV_PYTHON = "RIGFORGE_FBX_ENV_PYTHON"
 ENV_TOOLCHAIN = "RIGFORGE_FBX_TOOLCHAIN_DIR"

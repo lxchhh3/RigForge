@@ -1,0 +1,21 @@
+{
+  "avatar_id": "maya",
+  "description": "Maya's default BlendShapeChannel DeformPercent values, transcribed from her Unity package config (the weights loaded on pak load). Re-apply with tools/apply_avatar_blendshape_defaults.py if her ASCII source is ever regenerated from the binary Maya.fbx (which ships without these baked in).",
+  "provenance": "Unity SkinnedMeshRenderer blendshape weights, per-mesh. Source screenshots: temp/Blendshape_for_*.png",
+  "notes": [
+    "FACE morphs are intentionally NOT listed -> all 0. With the lip-sync viseme 'Λ' (U+039B) at 0, Maya's neutral face is a smile.",
+    "Match key is (mesh, channel) by name. Bra_X=100 is already baked in the FBX; the rest are Unity-only defaults.",
+    "Hat / Cloth entries apply only when those meshes aren't dropped at assemble time."
+  ],
+  "defaults": [
+    { "mesh": "Body all", "channel": "Over knee socks", "deform_percent": 100 },
+    { "mesh": "Body all", "channel": "Big breasts", "deform_percent": 50 },
+    { "mesh": "Underwear", "channel": "Big breasts", "deform_percent": 50 },
+    { "mesh": "Underwear", "channel": "Bra_X", "deform_percent": 100 },
+    { "mesh": "Over knee socks", "channel": "Over knee socks", "deform_percent": 100 },
+    { "mesh": "Hat", "channel": "Small", "deform_percent": 50 },
+    { "mesh": "Cloth", "channel": "Big breasts", "deform_percent": 50 },
+    { "mesh": "Cloth", "channel": "Short apron", "deform_percent": 50 },
+    { "mesh": "Cloth", "channel": "Short skirt", "deform_percent": 50 }
+  ]
+}
