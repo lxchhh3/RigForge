@@ -399,6 +399,123 @@ def test_phase_c_passthrough_renames_are_irrelevant_when_bones_match_target(
     assert b'"Model::Hips"' in result.merged_ascii
 
 
+# --- Secondary-role renaming (accessory bones: the unwired last mile) -------
+
+
+def _maya_secondary_bone(view, registry, *, weighted: bool = False):
+    """Pick a Maya LimbNode whose name is NOT a canonical target name (so it
+    rides along instead of being stripped). With weighted=True, require a
+    cluster carrying skin weight so the bone survives Phase C's zero-weight
+    sweep and reaches the output."""
+    maya = registry.get("maya")
+    canonical_names = set(maya.canonical_to_name.values())
+    for b in view.limb_bones():
+        if b.name in canonical_names:
+            continue
+        if weighted and not any(
+            view.clusters[c].weight_count > 0
+            for c in b.cluster_ids if c in view.clusters
+        ):
+            continue
+        return b
+    raise AssertionError("no suitable secondary bone in Maya view")
+
+
+def test_from_decisions_renames_structured_secondary_role(maya_fbx_ascii, registry, schema):
+    """A bone the LLM classified into a structured secondary role
+    (SkirtFront.C.01, HairSecondary.C.05, ...) gets a deterministic clean
+    name in the EditPlan. This is the accessory-naming last mile."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    maya = registry.get("maya")
+    sec = _maya_secondary_bone(view, registry)
+    decisions = DecisionSet(
+        bones=[Decision(model_id=sec.model_id, role="SkirtFront.C.01", verdict="keep")],
+        llm_model_id="t",
+    )
+    plan = EditPlan.from_decisions(decisions, view, maya, schema)
+    assert plan.renames.get(sec.model_id) == "SkirtFront.C.01"
+
+
+def test_from_decisions_preserves_secondary_fallback_name(maya_fbx_ascii, registry, schema):
+    """The `Secondary.<bone_name>` fallback role (the unknown-rewrite punt) is
+    intentionally NOT a schema secondary pattern, so it must NOT trigger a
+    rename — the bone keeps its original name."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    maya = registry.get("maya")
+    sec = _maya_secondary_bone(view, registry)
+    decisions = DecisionSet(
+        bones=[Decision(model_id=sec.model_id, role=f"Secondary.{sec.name}", verdict="keep")],
+        llm_model_id="t",
+    )
+    plan = EditPlan.from_decisions(decisions, view, maya, schema)
+    assert sec.model_id not in plan.renames
+
+
+def test_from_decisions_secondary_rename_requires_schema(maya_fbx_ascii, registry):
+    """Without a schema, from_decisions can't distinguish a structured
+    secondary role from a fallback, so it emits no secondary rename — backward
+    compatible with the canonical-only callers/tests."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    maya = registry.get("maya")
+    sec = _maya_secondary_bone(view, registry)
+    decisions = DecisionSet(
+        bones=[Decision(model_id=sec.model_id, role="SkirtFront.C.01", verdict="keep")],
+        llm_model_id="t",
+    )
+    plan = EditPlan.from_decisions(decisions, view, maya)  # no schema
+    assert sec.model_id not in plan.renames
+
+
+def test_phase_c_applies_secondary_rename_to_ride_along_bone(maya_fbx_ascii, registry, schema):
+    """The payoff: a ride-along accessory bone (not stripped, not dropped) is
+    actually renamed in the merged output. Maya-as-clothing → Moe target; a
+    weighted Maya secondary bone is classified SkirtFront.C.01 and must appear
+    under that clean name (and not its original messy name) in the output."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    moe = registry.get("moe")
+    maya_canon = set(registry.get("maya").canonical_to_name.values())
+    moe_names = {b.name for b in moe.load_ascii_view().bones.values()}
+    # Ride-along (not canonical) + survives the zero-weight sweep (weighted) +
+    # name unique to the clothing (absent from the Moe target) so the only
+    # Model::<name> in the output is the clothing's — which we rename away.
+    sec = next(
+        b for b in view.limb_bones()
+        if b.name not in maya_canon and b.name not in moe_names
+        and any(view.clusters[c].weight_count > 0 for c in b.cluster_ids if c in view.clusters)
+    )
+
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+    bones = []
+    for b in view.limb_bones():
+        if b.model_id == sec.model_id:
+            bones.append(Decision(model_id=b.model_id, role="SkirtFront.C.01", verdict="keep"))
+            continue
+        role = display_to_role.get(b.name)
+        bones.append(Decision(
+            model_id=b.model_id,
+            role=role if role is not None else f"Secondary.{b.name}",
+            verdict="keep",
+        ))
+    decisions = DecisionSet(bones=bones, llm_model_id="t-sec-rename")
+    plan = EditPlan.from_decisions(decisions, view, moe, schema)
+    assert plan.renames.get(sec.model_id) == "SkirtFront.C.01"
+
+    result = run_phase_c(
+        clothing_ascii=raw,
+        clothing_view=view,
+        donor_id="maya",
+        target_id="moe",
+        registry=registry,
+        edit_plan=plan,
+        decisions=decisions,
+    )
+    merged = result.merged_ascii
+    assert b'"Model::SkirtFront.C.01"' in merged, "ride-along bone not renamed in output"
+    assert f'"Model::{sec.name}"'.encode("ascii") not in merged, "original messy name survived"
+    extract(parse(merged))  # output re-parses cleanly
+
+
 # --- EditPlan.from_decisions reparent wiring (v2) --------------------------
 
 

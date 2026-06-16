@@ -39,6 +39,7 @@ from rigforge.ascii_fbx.edits import (
     drop_bone_edits,
     drop_mesh_edits,
     drop_node_edit,
+    rename_bone_edits,
     set_blend_shape_channel_deform_percent_edits,
 )
 from rigforge.ascii_fbx.lexer import parse as parse_fbx
@@ -288,6 +289,7 @@ def _run_merge(
     #    can be repointed to target bone ids in the id_offset pass — that's
     #    how secondary chains (Hair, Breast, ornament bones) get reparented
     #    onto the target armature.
+    dropped_ids = set(edit_plan.drops)
     strip_edits: list[TextEdit] = []
     for bid in kept_bone_ids:
         bone = clothing_view.bones.get(bid)
@@ -303,6 +305,30 @@ def _run_merge(
             notes.append(f"skip: drop bone id={bid} not in clothing view")
             continue
         strip_edits.extend(drop_bone_edits(clothing_view, bone))
+
+    # Apply bone renames — but ONLY to clothing bones that RIDE ALONG into the
+    # merged output (neither stripped via kept_bone_ids nor dropped). For a
+    # canonical bone the rename is moot: it's stripped and the target supplies
+    # the name, and renaming it here would also overlap the strip edit. The
+    # renames that legitimately land are the structured secondary roles
+    # (SkirtSide.L.16, HairSecondary.C.05, ...) the LLM classified — this is
+    # the accessory-naming last mile: the modder finally gets clean, managed
+    # names instead of the clothing's original messy ones.
+    renamed = 0
+    for bid, new_name in edit_plan.renames.items():
+        if bid in kept_bone_ids or bid in dropped_ids:
+            continue
+        bone = clothing_view.bones.get(bid)
+        if bone is None:
+            notes.append(f"skip: rename bone id={bid} not in clothing view")
+            continue
+        strip_edits.extend(rename_bone_edits(clothing_view, bone, new_name))
+        renamed += 1
+    if edit_plan.renames:
+        notes.append(
+            f"rename: applied {renamed}/{len(edit_plan.renames)} bone renames "
+            f"(ride-along secondary bones; canonical renames are moot post-merge)"
+        )
     # Strip clothing's armature root (Type=Null Models). Repoint children
     # pointing at it to the TARGET's armature Null so the surviving sub-tree
     # inherits the avatar's root transform (the -90 Y-up/Z-up rotation). The

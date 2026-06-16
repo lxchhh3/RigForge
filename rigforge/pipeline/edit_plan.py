@@ -10,10 +10,24 @@ Phase C consumes the EditPlan to actually rewrite the FBX bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from rigforge.ascii_fbx.sections import SectionView
 from rigforge.avatars.registry import CuratedAvatar
 from rigforge.canonical.decisions import DecisionSet
+from rigforge.canonical.schema import CanonicalSchema
+
+
+def _secondary_role_to_name(role: str) -> str:
+    """Clean, deterministic bone name for a structured secondary role.
+
+    The role string is already the canonical, manageable label
+    (e.g. 'SkirtSide.L.16', 'HairSecondary.C.05'), so we use it verbatim.
+    Keeping the output name identical to the role makes the naming scheme
+    self-documenting and stable across runs. Centralized here so a future
+    convention change (underscores, prefixes) is a one-line edit.
+    """
+    return role
 
 
 @dataclass
@@ -31,6 +45,7 @@ class EditPlan:
         decisions: DecisionSet,
         view: SectionView,
         target_avatar: CuratedAvatar,
+        schema: Optional[CanonicalSchema] = None,
     ) -> "EditPlan":
         drops: list[int] = []
         renames: dict[int, str] = {}
@@ -56,14 +71,32 @@ class EditPlan:
                 if target_bone_id is not None and target_bone_id != d.model_id:
                     reparents[d.model_id] = target_bone_id
 
-            if d.role not in target_avatar.canonical_to_name:
-                # Secondary roles (Breast.L.01, HairSecondary.C, ...) aren't in
-                # target's canonical_to_name. We leave their names untouched.
-                continue
-            target_name = target_avatar.canonical_to_name[d.role]
             bone = view.bones.get(d.model_id)
             if bone is None:
                 continue
-            if bone.name != target_name:
-                renames[d.model_id] = target_name
+
+            if d.role in target_avatar.canonical_to_name:
+                # Canonical humanoid bone. Note: in the merge-based Phase C
+                # these bones get stripped and the target supplies the name,
+                # so this rename is moot for the assembled output — see
+                # test_phase_c_passthrough_renames_are_irrelevant_*. We still
+                # compute it: it's the B→C contract, drives the manifest's
+                # n_renames, and the rename DOES land in the rare path where a
+                # canonical bone rides along unmatched.
+                target_name = target_avatar.canonical_to_name[d.role]
+                if bone.name != target_name:
+                    renames[d.model_id] = target_name
+            elif schema is not None and schema.is_secondary(d.role):
+                # Structured secondary role (SkirtSide.L.16, HairSecondary.C.05,
+                # Accessory.C.01, ...). These bones are NOT in the target's
+                # canonical_to_name, so Phase C lets them ride along into the
+                # output unstripped — which means this rename is NOT moot: it's
+                # where the modder finally gets clean, manageable accessory
+                # names. The `Secondary.<bone_name>` fallback role is
+                # deliberately not a schema secondary pattern, so it's excluded
+                # here and keeps its original name.
+                clean = _secondary_role_to_name(d.role)
+                if bone.name != clean:
+                    renames[d.model_id] = clean
+            # else: unrecognized/fallback role — leave the name untouched.
         return cls(drops=drops, renames=renames, reparents=reparents)
