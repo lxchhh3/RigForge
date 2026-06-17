@@ -399,6 +399,67 @@ def test_phase_c_passthrough_renames_are_irrelevant_when_bones_match_target(
     assert b'"Model::Hips"' in result.merged_ascii
 
 
+# Tiny clothing/target rigs for the name-based repoint fallback test. The
+# clothing's Hips is MISNAMED (JBip_Hips) so it can't match the target by name;
+# its EditPlan rename target ("Hips") is what should strip it. Spine matches by
+# name directly. Ribbon is a genuine ornament (its rename target isn't a target
+# bone) and must ride along.
+_FALLBACK_CLOTHING_FBX = b"""\
+; FBX 7.4.0 project file
+Objects:  {
+\tModel: 100, "Model::JBip_Hips", "LimbNode" {
+\t}
+\tModel: 101, "Model::Spine", "LimbNode" {
+\t}
+\tModel: 102, "Model::Ribbon", "LimbNode" {
+\t}
+}
+Connections:  {
+\tC: "OO",100,0
+\tC: "OO",101,100
+\tC: "OO",102,100
+}
+"""
+
+_FALLBACK_TARGET_FBX = b"""\
+; FBX 7.4.0 project file
+Objects:  {
+\tModel: 200, "Model::Hips", "LimbNode" {
+\t}
+\tModel: 201, "Model::Spine", "LimbNode" {
+\t}
+}
+Connections:  {
+\tC: "OO",200,0
+\tC: "OO",201,200
+}
+"""
+
+
+def test_name_based_repoint_strips_misnamed_canonical_via_rename_target():
+    """A clothing canonical bone that misses by NAME but whose EditPlan rename
+    target IS a target bone must be stripped + repointed (not ride along and
+    duplicate). Ornament bones whose rename target isn't a target bone still
+    ride along."""
+    from rigforge.pipeline.phase_c import _build_name_based_repoint
+
+    clothing = extract(parse(_FALLBACK_CLOTHING_FBX))
+    target = extract(parse(_FALLBACK_TARGET_FBX))
+    plan = EditPlan(drops=[], renames={100: "Hips", 102: "Ribbon_EN"})
+
+    repoint, kept = _build_name_based_repoint(clothing, target, plan, notes=[])
+
+    # JBip_Hips: name miss, rename target "Hips" IS a target bone -> stripped+repointed.
+    assert repoint.get(100) == 200
+    assert 100 in kept
+    # Spine: matched directly by name.
+    assert repoint.get(101) == 201
+    assert 101 in kept
+    # Ribbon: rename target "Ribbon_EN" is NOT a target bone -> rides along.
+    assert 102 not in kept
+    assert 102 not in repoint
+
+
 # --- Bone-name translation (readability for the multilingual team) ----------
 
 

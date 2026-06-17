@@ -307,6 +307,7 @@ def _build_name_based_repoint(
     kept_bone_ids: set[int] = set()
     matched = 0
     total = 0
+    via_rename = 0
     for b in clothing_view.bones.values():
         if b.type_class != "LimbNode":
             continue
@@ -315,11 +316,31 @@ def _build_name_based_repoint(
             continue
         tid = target_by_name.get(b.name)
         if tid is None:
+            # Name miss. The clothing bone might still BE a canonical bone the
+            # target carries — just under a different name (e.g. it kept a
+            # `JBip_` prefix, or a slightly-off spine name). Phase B's EditPlan
+            # renames such a bone to the target's canonical name, so fall back
+            # to that rename target. If it resolves to a real target bone, this
+            # bone is canonical → strip + repoint it (the rename then becomes
+            # moot in _run_merge, which skips kept_bone_ids). Without this it
+            # would ride along AND get renamed → a DUPLICATE of the target's
+            # bone, leaving the clothing bound to a stray copy. Ornament bones
+            # whose rename target (an English name_en) isn't a target bone fall
+            # through and correctly ride along.
+            renamed = edit_plan.renames.get(b.model_id)
+            if renamed is not None:
+                tid = target_by_name.get(renamed)
+                if tid is not None:
+                    via_rename += 1
+        if tid is None:
             continue
         repoint_table[b.model_id] = tid
         kept_bone_ids.add(b.model_id)
         matched += 1
-    notes.append(f"name-repoint: matched {matched}/{total} clothing bones to target")
+    notes.append(
+        f"name-repoint: matched {matched}/{total} clothing bones to target"
+        + (f" ({via_rename} via canonical rename-target fallback)" if via_rename else "")
+    )
     return repoint_table, kept_bone_ids
 
 
