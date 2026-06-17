@@ -1,33 +1,49 @@
 """EditPlan — the deterministic output of Phase B step 5.
 
 Per PLAN.md:
-    drops = `verdict=drop`
-    renames = `{donor_name → target_avatar.canonical_to_name[role]}`
-             for each kept canonical bone
+    drops   = `verdict=drop`
+    renames =
+        - canonical bones  → `target_avatar.canonical_to_name[role]`
+          (moot under the always-merge Phase C — those bones are stripped and
+          the target supplies the name — but kept as the B→C contract);
+        - non-canonical ride-along bones → their English translation
+          (`Decision.name_en`) so the multilingual team can read JP/KR/CN
+          Booth bone names. Absent name_en → the bone keeps its original name.
 
 Phase C consumes the EditPlan to actually rewrite the FBX bytes.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 from rigforge.ascii_fbx.sections import SectionView
 from rigforge.avatars.registry import CuratedAvatar
 from rigforge.canonical.decisions import DecisionSet
-from rigforge.canonical.schema import CanonicalSchema
 
 
-def _secondary_role_to_name(role: str) -> str:
-    """Clean, deterministic bone name for a structured secondary role.
+_WHITESPACE_RE = re.compile(r"\s+")
+_UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_.\-]+")
 
-    The role string is already the canonical, manageable label
-    (e.g. 'SkirtSide.L.16', 'HairSecondary.C.05'), so we use it verbatim.
-    Keeping the output name identical to the role makes the naming scheme
-    self-documenting and stable across runs. Centralized here so a future
-    convention change (underscores, prefixes) is a one-line edit.
+
+def _sanitize_bone_name(name: Optional[str]) -> Optional[str]:
+    """Coerce an LLM-proposed English name into a Blender/FBX-safe token:
+    trim, collapse whitespace to '_', drop chars outside [A-Za-z0-9_.-], and
+    strip leading/trailing separators.
+
+    Returns None when nothing usable survives — e.g. the model left the name
+    untranslated (still CJK) so every char is stripped — so the caller keeps
+    the bone's original name instead of emitting an empty/garbage rename.
     """
-    return role
+    if not name:
+        return None
+    s = _WHITESPACE_RE.sub("_", name.strip())
+    s = _UNSAFE_CHARS_RE.sub("", s)
+    s = s.strip("_.-")
+    if not s or not re.search(r"[A-Za-z0-9]", s):
+        return None
+    return s
 
 
 @dataclass
@@ -45,7 +61,6 @@ class EditPlan:
         decisions: DecisionSet,
         view: SectionView,
         target_avatar: CuratedAvatar,
-        schema: Optional[CanonicalSchema] = None,
     ) -> "EditPlan":
         drops: list[int] = []
         renames: dict[int, str] = {}
@@ -76,27 +91,28 @@ class EditPlan:
                 continue
 
             if d.role in target_avatar.canonical_to_name:
-                # Canonical humanoid bone. Note: in the merge-based Phase C
-                # these bones get stripped and the target supplies the name,
-                # so this rename is moot for the assembled output — see
-                # test_phase_c_passthrough_renames_are_irrelevant_*. We still
-                # compute it: it's the B→C contract, drives the manifest's
-                # n_renames, and the rename DOES land in the rare path where a
-                # canonical bone rides along unmatched.
+                # Canonical humanoid bone. Under the merge-based Phase C these
+                # bones get stripped and the target supplies the name, so this
+                # rename is moot for the assembled output (see
+                # test_phase_c_passthrough_renames_are_irrelevant_*). Kept
+                # because it's the B→C contract, drives manifest n_renames, and
+                # lands in the rare path where a canonical bone rides along
+                # unmatched.
                 target_name = target_avatar.canonical_to_name[d.role]
                 if bone.name != target_name:
                     renames[d.model_id] = target_name
-            elif schema is not None and schema.is_secondary(d.role):
-                # Structured secondary role (SkirtSide.L.16, HairSecondary.C.05,
-                # Accessory.C.01, ...). These bones are NOT in the target's
-                # canonical_to_name, so Phase C lets them ride along into the
-                # output unstripped — which means this rename is NOT moot: it's
-                # where the modder finally gets clean, manageable accessory
-                # names. The `Secondary.<bone_name>` fallback role is
-                # deliberately not a schema secondary pattern, so it's excluded
-                # here and keeps its original name.
-                clean = _secondary_role_to_name(d.role)
-                if bone.name != clean:
-                    renames[d.model_id] = clean
-            # else: unrecognized/fallback role — leave the name untouched.
+            else:
+                # Non-canonical bone — rides along into the output keeping the
+                # clothing's own name. Replace it with the LLM's English
+                # translation so the multilingual team can read it (Booth/KR/CN
+                # rigs ship JP/KR/CN bone names). Applies to every non-canonical
+                # kept bone — structured secondary roles AND the unknown
+                # `Secondary.<name>` fallback — because readability is the goal,
+                # not the role bucket. Sanitized to a Blender-safe token; when
+                # name_en is absent or unusable (left untranslated) we keep the
+                # original name — backward compatible with cache/fixtures that
+                # predate the field.
+                en = _sanitize_bone_name(d.name_en)
+                if en is not None and en != bone.name:
+                    renames[d.model_id] = en
         return cls(drops=drops, renames=renames, reparents=reparents)

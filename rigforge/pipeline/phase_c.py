@@ -310,10 +310,10 @@ def _run_merge(
     # merged output (neither stripped via kept_bone_ids nor dropped). For a
     # canonical bone the rename is moot: it's stripped and the target supplies
     # the name, and renaming it here would also overlap the strip edit. The
-    # renames that legitimately land are the structured secondary roles
-    # (SkirtSide.L.16, HairSecondary.C.05, ...) the LLM classified — this is
-    # the accessory-naming last mile: the modder finally gets clean, managed
-    # names instead of the clothing's original messy ones.
+    # renames that legitimately land are the non-canonical ride-along bones,
+    # renamed to their English translation (Decision.name_en) so the
+    # multilingual team can read non-English Booth bone names (a JP/KR/CN
+    # name becomes e.g. Skirt_Front.001). Bones without a name_en keep theirs.
     renamed = 0
     for bid, new_name in edit_plan.renames.items():
         if bid in kept_bone_ids or bid in dropped_ids:

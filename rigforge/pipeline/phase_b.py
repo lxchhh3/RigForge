@@ -125,7 +125,7 @@ def run_phase_b(
                 violations=errs,
             )
 
-    plan = EditPlan.from_decisions(decisions, view, target_avatar, schema)
+    plan = EditPlan.from_decisions(decisions, view, target_avatar)
     return PhaseBResult(
         decisions=decisions,
         edit_plan=plan,

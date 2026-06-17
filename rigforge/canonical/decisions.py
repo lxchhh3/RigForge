@@ -24,6 +24,11 @@ class Decision(BaseModel):
     # as-input parent; Phase C is expected to emit a `reparent_bone_edits`
     # call against the resolved target id.
     new_parent_role: Optional[str] = None
+    # v2.2: English translation / normalized name for the bone. The LLM emits
+    # this so non-English (JP/KR/CN) Booth bone names become readable for the
+    # team. Phase C renames ride-along (non-canonical) bones to it; absent
+    # (older cache/fixtures) → the bone keeps its original name.
+    name_en: Optional[str] = None
 
 
 class DecisionSet(BaseModel):

@@ -9,7 +9,8 @@ roles); the call site doesn't change.
 Output contract — model MUST return ONLY JSON of shape:
     {"bones": [
         {"model_id": <int>, "role": <str>, "verdict": "keep"|"drop",
-         "drop_category": <str|null>, "confidence": <float 0..1>},
+         "drop_category": <str|null>, "confidence": <float 0..1>,
+         "name_en": <str>},
         ...
     ]}
 """
@@ -78,7 +79,7 @@ def _system_message(schema: CanonicalSchema) -> str:
         '             — pair with verdict="drop"',
         '  - DO NOT EMIT "unknown". If you cannot identify a bone, use a',
         '    secondary role like "Secondary.<bone_name>" with verdict="keep".',
-        '    The pipeline will preserve it without renaming.',
+        '    The pipeline keeps it (renamed to its name_en for readability).',
         "",
         'VERDICT must be "keep" or "drop". Junk bones get verdict="drop".',
         "",
@@ -91,6 +92,16 @@ def _system_message(schema: CanonicalSchema) -> str:
         "  SHOULD hold. The pipeline will reparent it at edit time. Omit the",
         "  field for bones whose input parent already matches the canonical",
         "  chain. The target role must itself be assigned to another kept bone.",
+        "",
+        "REQUIRED FIELD — name_en (an English, tool-safe name for EVERY bone):",
+        "  - Translate non-English names (Japanese/Korean/Chinese) to English.",
+        "  - KEEP established rigging romaji as-is (e.g. Kemomimi, Ahoge, Sode);",
+        "    do NOT over-translate community terms.",
+        "  - If the name is already English, return it unchanged.",
+        "  - PRESERVE any numeric/index tail exactly (.001, _02) so chain order",
+        "    and uniqueness survive.",
+        "  - ASCII only, words joined by underscores, NO spaces, only",
+        "    [A-Za-z0-9_.-]. E.g. a Japanese 'front skirt' bone -> Skirt_Front.",
         "",
         "RULES:",
         "  1. Each canonical role appears AT MOST ONCE across kept bones.",
@@ -125,7 +136,7 @@ def _system_message(schema: CanonicalSchema) -> str:
         '{"bones": [',
         '  {"model_id": <int>, "role": "<role>", "verdict": "<keep|drop>",',
         '   "drop_category": "<aux|twist|ik_target|null_locator|duplicate|null>",',
-        '   "confidence": <float 0..1>,',
+        '   "confidence": <float 0..1>, "name_en": "<English tool-safe name>",',
         '   "new_parent_role": "<canonical role or omit>"},',
         "  ...one per input bone...",
         "]}",

@@ -43,12 +43,12 @@ clothing_ascii.fbx (text)
     │           ▼       ▼
     │       re-prompt   EditPlan.from_decisions(...)
     │       (once)        drops   = {bone_id : verdict == "drop"}
-    │                     renames = {bone_id : clean_name_for(role)} (if names differ;
-    │                               canonical→target name, structured secondary→role string)
+    │                     renames = {bone_id : new_name} (if it differs; canonical→target
+    │                               name, non-canonical ride-along→English name_en translation)
     │                     reparents = {bone_id : target_bone_id_for(new_parent_role)}
     │
     ├──► Phase C: merge onto target. Apply drops; apply renames to the
-    │             ride-along secondary bones (canonical bones are stripped —
+    │             ride-along (non-canonical) bones (canonical bones are stripped —
     │             the target owns their names — so those renames + reparents
     │             are moot); in cross-avatar, also dedup materials/blendshapes
     │             by name, apply user mesh/channel drops + DeformPercent

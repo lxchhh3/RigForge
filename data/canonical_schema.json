@@ -1,6 +1,6 @@
 {
-  "version": "2.1",
-  "description": "RigForge v2 canonical bone schema. v2.0 promotes fingers and twist bones to canonical roles (both optional). v2.1 adds an 'Accessory' secondary pattern so the LLM has a real role for kept structural-only parent bones (ribbon roots, jacket roots, decorative chain anchors) whose subtree carries skin weights even though the bone itself doesn't fit a canonical role. Bumping this version invalidates all cached LLM decisions.",
+  "version": "2.2",
+  "description": "RigForge v2 canonical bone schema. v2.0 promotes fingers and twist bones to canonical roles (both optional). v2.1 adds an 'Accessory' secondary pattern so the LLM has a real role for kept structural-only parent bones (ribbon roots, jacket roots, decorative chain anchors) whose subtree carries skin weights even though the bone itself doesn't fit a canonical role. v2.2 adds the per-bone 'name_en' output field (English/tool-safe name) so non-English (JP/KR/CN) Booth bone names become readable; Phase C renames ride-along bones to it. Bumping this version invalidates all cached LLM decisions (the version is part of the cache key), so existing classifications re-run and pick up name_en.",
   "roles": {
     "Hips":       {"parent": null,        "category": "core"},
     "Spine":      {"parent": "Hips",      "category": "core"},

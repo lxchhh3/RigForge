@@ -89,7 +89,7 @@ Rail D is the spine. Rail L is a single classification node inside Phase B — n
 ### Phase C — Armature Merge (deterministic only)
 
 1. Load cached target-avatar ASCII (binary→ASCII done once at registry-build).
-2. Drop clothing's armature root. Strip clothing's **canonical** bone Models — the target avatar owns those, and its bones supply the canonical names via the name/role repoint (step 3), so renaming the clothing copy is moot. Clothing-specific **secondary** bones (skirt/hair/accessory chains) ride along and are renamed in place to their LLM-assigned structured role (e.g. `SkirtSide.L.16`) — this is where the modder gets clean accessory names.
+2. Drop clothing's armature root. Strip clothing's **canonical** bone Models — the target avatar owns those, and its bones supply the canonical names via the name/role repoint (step 3), so renaming the clothing copy is moot. Non-canonical bones (skirt/hair/accessory chains, plus anything the LLM couldn't place) ride along and are **renamed to their English translation** (`Decision.name_en` — e.g. a Japanese front-skirt bone → `Skirt_Front.001`), so the multilingual team can read JP/KR/CN Booth bone names. Established rigging romaji (Kemomimi, Ahoge) is kept as-is; bones the LLM left without a `name_en` keep their original name.
 3. Re-point cluster connections so `Cluster`-to-bone connections target the *target avatar's* model ids by name lookup.
 4. Append clothing meshes + (re-pointed) clusters into the target avatar's Objects + Connections sections.
 5. Renumber colliding model ids (collision check happens at registry load).

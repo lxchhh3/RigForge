@@ -399,7 +399,7 @@ def test_phase_c_passthrough_renames_are_irrelevant_when_bones_match_target(
     assert b'"Model::Hips"' in result.merged_ascii
 
 
-# --- Secondary-role renaming (accessory bones: the unwired last mile) -------
+# --- Bone-name translation (readability for the multilingual team) ----------
 
 
 def _maya_secondary_bone(view, registry, *, weighted: bool = False):
@@ -421,10 +421,52 @@ def _maya_secondary_bone(view, registry, *, weighted: bool = False):
     raise AssertionError("no suitable secondary bone in Maya view")
 
 
-def test_from_decisions_renames_structured_secondary_role(maya_fbx_ascii, registry, schema):
-    """A bone the LLM classified into a structured secondary role
-    (SkirtFront.C.01, HairSecondary.C.05, ...) gets a deterministic clean
-    name in the EditPlan. This is the accessory-naming last mile."""
+def test_sanitize_bone_name_blender_safe():
+    """name_en is coerced to a Blender/FBX-safe token; unusable input (no ASCII
+    content left, e.g. untranslated CJK) returns None so the caller keeps the
+    original name."""
+    from rigforge.pipeline.edit_plan import _sanitize_bone_name
+    assert _sanitize_bone_name("Skirt Front") == "Skirt_Front"
+    assert _sanitize_bone_name("  Skirt_Front.001  ") == "Skirt_Front.001"
+    assert _sanitize_bone_name("Skirt/Front!") == "SkirtFront"
+    assert _sanitize_bone_name("スカート") is None  # untranslated JP → keep original
+    assert _sanitize_bone_name("") is None
+    assert _sanitize_bone_name(None) is None
+
+
+def test_from_decisions_translates_non_canonical_bone_to_name_en(maya_fbx_ascii, registry):
+    """A non-canonical (ride-along) bone is renamed to its English translation
+    (Decision.name_en) so the multilingual team can read it."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    maya = registry.get("maya")
+    sec = _maya_secondary_bone(view, registry)
+    decisions = DecisionSet(
+        bones=[Decision(model_id=sec.model_id, role="SkirtFront.C.01",
+                        verdict="keep", name_en="Skirt_Front_01")],
+        llm_model_id="t",
+    )
+    plan = EditPlan.from_decisions(decisions, view, maya)
+    assert plan.renames.get(sec.model_id) == "Skirt_Front_01"
+
+
+def test_from_decisions_translates_unknown_fallback_bone_too(maya_fbx_ascii, registry):
+    """Even a Secondary.<name> fallback bone gets translated — readability is
+    the goal, regardless of how confidently the LLM classified the role."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    maya = registry.get("maya")
+    sec = _maya_secondary_bone(view, registry)
+    decisions = DecisionSet(
+        bones=[Decision(model_id=sec.model_id, role=f"Secondary.{sec.name}",
+                        verdict="keep", name_en="Translated_Thing")],
+        llm_model_id="t",
+    )
+    plan = EditPlan.from_decisions(decisions, view, maya)
+    assert plan.renames.get(sec.model_id) == "Translated_Thing"
+
+
+def test_from_decisions_no_translation_without_name_en(maya_fbx_ascii, registry):
+    """No name_en (None — e.g. cache/fixtures predating the field) → no rename;
+    the bone keeps its original name. Backward compatible."""
     view = extract(parse(maya_fbx_ascii.read_bytes()))
     maya = registry.get("maya")
     sec = _maya_secondary_bone(view, registry)
@@ -432,64 +474,50 @@ def test_from_decisions_renames_structured_secondary_role(maya_fbx_ascii, regist
         bones=[Decision(model_id=sec.model_id, role="SkirtFront.C.01", verdict="keep")],
         llm_model_id="t",
     )
-    plan = EditPlan.from_decisions(decisions, view, maya, schema)
-    assert plan.renames.get(sec.model_id) == "SkirtFront.C.01"
+    plan = EditPlan.from_decisions(decisions, view, maya)
+    assert sec.model_id not in plan.renames
 
 
-def test_from_decisions_preserves_secondary_fallback_name(maya_fbx_ascii, registry, schema):
-    """The `Secondary.<bone_name>` fallback role (the unknown-rewrite punt) is
-    intentionally NOT a schema secondary pattern, so it must NOT trigger a
-    rename — the bone keeps its original name."""
+def test_from_decisions_skips_translation_equal_to_original(maya_fbx_ascii, registry):
+    """If name_en already equals the bone's name (already English), no rename."""
     view = extract(parse(maya_fbx_ascii.read_bytes()))
     maya = registry.get("maya")
     sec = _maya_secondary_bone(view, registry)
     decisions = DecisionSet(
-        bones=[Decision(model_id=sec.model_id, role=f"Secondary.{sec.name}", verdict="keep")],
+        bones=[Decision(model_id=sec.model_id, role="Secondary.x",
+                        verdict="keep", name_en=sec.name)],
         llm_model_id="t",
     )
-    plan = EditPlan.from_decisions(decisions, view, maya, schema)
+    plan = EditPlan.from_decisions(decisions, view, maya)
     assert sec.model_id not in plan.renames
 
 
-def test_from_decisions_secondary_rename_requires_schema(maya_fbx_ascii, registry):
-    """Without a schema, from_decisions can't distinguish a structured
-    secondary role from a fallback, so it emits no secondary rename — backward
-    compatible with the canonical-only callers/tests."""
-    view = extract(parse(maya_fbx_ascii.read_bytes()))
-    maya = registry.get("maya")
-    sec = _maya_secondary_bone(view, registry)
-    decisions = DecisionSet(
-        bones=[Decision(model_id=sec.model_id, role="SkirtFront.C.01", verdict="keep")],
-        llm_model_id="t",
-    )
-    plan = EditPlan.from_decisions(decisions, view, maya)  # no schema
-    assert sec.model_id not in plan.renames
-
-
-def test_phase_c_applies_secondary_rename_to_ride_along_bone(maya_fbx_ascii, registry, schema):
-    """The payoff: a ride-along accessory bone (not stripped, not dropped) is
-    actually renamed in the merged output. Maya-as-clothing → Moe target; a
-    weighted Maya secondary bone is classified SkirtFront.C.01 and must appear
-    under that clean name (and not its original messy name) in the output."""
+def test_phase_c_applies_translation_to_ride_along_bone(maya_fbx_ascii, registry):
+    """The payoff: a ride-along bone is renamed to its English translation in
+    the merged output. Maya-as-clothing → Moe target; a weighted Maya bone
+    unique to the clothing is given name_en and must appear under that name
+    (and not its original) in the output."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     moe = registry.get("moe")
     maya_canon = set(registry.get("maya").canonical_to_name.values())
     moe_names = {b.name for b in moe.load_ascii_view().bones.values()}
     # Ride-along (not canonical) + survives the zero-weight sweep (weighted) +
-    # name unique to the clothing (absent from the Moe target) so the only
-    # Model::<name> in the output is the clothing's — which we rename away.
+    # name unique to the clothing (absent from Moe) so the only Model::<name>
+    # in the output is the clothing's — which we translate away.
     sec = next(
         b for b in view.limb_bones()
         if b.name not in maya_canon and b.name not in moe_names
         and any(view.clusters[c].weight_count > 0 for c in b.cluster_ids if c in view.clusters)
     )
+    translated = "Translated_RideAlong_01"
 
     display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
     bones = []
     for b in view.limb_bones():
         if b.model_id == sec.model_id:
-            bones.append(Decision(model_id=b.model_id, role="SkirtFront.C.01", verdict="keep"))
+            bones.append(Decision(model_id=b.model_id, role="SkirtFront.C.01",
+                                  verdict="keep", name_en=translated))
             continue
         role = display_to_role.get(b.name)
         bones.append(Decision(
@@ -497,9 +525,9 @@ def test_phase_c_applies_secondary_rename_to_ride_along_bone(maya_fbx_ascii, reg
             role=role if role is not None else f"Secondary.{b.name}",
             verdict="keep",
         ))
-    decisions = DecisionSet(bones=bones, llm_model_id="t-sec-rename")
-    plan = EditPlan.from_decisions(decisions, view, moe, schema)
-    assert plan.renames.get(sec.model_id) == "SkirtFront.C.01"
+    decisions = DecisionSet(bones=bones, llm_model_id="t-translate")
+    plan = EditPlan.from_decisions(decisions, view, moe)
+    assert plan.renames.get(sec.model_id) == translated
 
     result = run_phase_c(
         clothing_ascii=raw,
@@ -511,8 +539,8 @@ def test_phase_c_applies_secondary_rename_to_ride_along_bone(maya_fbx_ascii, reg
         decisions=decisions,
     )
     merged = result.merged_ascii
-    assert b'"Model::SkirtFront.C.01"' in merged, "ride-along bone not renamed in output"
-    assert f'"Model::{sec.name}"'.encode("ascii") not in merged, "original messy name survived"
+    assert f'"Model::{translated}"'.encode("ascii") in merged, "ride-along bone not translated in output"
+    assert f'"Model::{sec.name}"'.encode("ascii") not in merged, "original name should be gone (translated)"
     extract(parse(merged))  # output re-parses cleanly
 
 
