@@ -52,7 +52,10 @@ clothing_ascii.fbx (text)
     │             the target owns their names — so those renames + reparents
     │             are moot); in cross-avatar, also dedup materials/blendshapes
     │             by name, apply user mesh/channel drops + DeformPercent
-    │             overrides, splice into target's Objects + Connections.
+    │             overrides; translate JP/KR morph (blendshape channel) + mesh +
+    │             mesh-data names to English via the dictionary (clothing always;
+    │             target behind translate_target_morphs); splice into target's
+    │             Objects + Connections.
     │
     ▼
 assembled_ascii.fbx
@@ -76,9 +79,17 @@ rigforge/
 │                       drop_bone_edits, rename_bone_edits, reparent_bone_edits,
 │                       drop_cluster_edits, drop_mesh_edits,
 │                       drop_blend_shape_channel_edits,
-│                       set_blend_shape_channel_deform_percent_edits (all v2)
+│                       set_blend_shape_channel_deform_percent_edits,
+│                       rename_blend_shape_channel_edits, rename_mesh_edits,
+│                       rename_geometry_edits (all v2)
+├── naming.py        dictionary JP/KR→EN name translation (no LLM):
+│                     load_translation_table() + translate_name() — exact match,
+│                     then peel laterality (_L/_R/右/左) + index tails (incl.
+│                     full-width digits) and recompose. Backs the morph/mesh
+│                     translation step in Phase C. Table: data/name_translation.json
 ├── canonical/
-│   ├── schema.py     CanonicalSchema (v2.1: core/arms/legs + fingers + twist)
+│   ├── schema.py     CanonicalSchema (v2.2: core/arms/legs + fingers + twist
+│   │                 + per-bone name_en English translation)
 │   ├── decisions.py  Decision / DecisionSet (incl. new_parent_role)
 │   └── validators.py 7 rules + driver (user_dropped exempt from drop_safety)
 ├── avatars/
@@ -103,7 +114,10 @@ rigforge/
 │   │                 applies drop_mesh_ids + drop_blend_shape_channel_ids
 │   │                 + blend_shape_channel_overrides (DeformPercent) in
 │   │                 both branches; target_* counterparts in cross-merge only;
-│   │                 materials/blendshapes dedup-and-repoint in cross-merge
+│   │                 materials/blendshapes dedup-and-repoint in cross-merge;
+│   │                 _translate_morph_and_mesh_edits (morph/mesh/mesh-data
+│   │                 names → EN); name-based repoint has a rename-target
+│   │                 fallback so a misnamed canonical bone strips, not doubles
 │   ├── edit_plan.py  EditPlan.from_decisions (drops + renames + reparents)
 │   └── orchestrator.py  assemble() — full bin→ASCII→A→B→C→ASCII→bin;
 │                     emits progress_cb(phase, note) at each phase boundary
@@ -194,10 +208,10 @@ Error → one re-prompt with violation text appended → second failure raises.
 
 | Path | Kind |
 |---|---|
-| `tests/test_*.py` | pytest — 319 tests, ~9m. HTTP mocked, FBX via fixtures. Covers lexer, sections + affinity, edits (incl. drop_mesh + drop_blend_shape_channel + set_blend_shape_channel_deform_percent), validators, cache, merge primitives, Phase A/B/C (incl. cross-merge materials/blendshapes dedup, channel drops, and DeformPercent overrides), the API endpoints (sync + streaming assemble), the LLM client + streaming NDJSON, and end-to-end on real Maya.fbx. |
-| `tests/test_e2e.py` | Full pipeline against `MockLLMClient` → binary compare vs Maya.fbx → must be identical. |
-| `tests/test_api.py` | TestClient against the FastAPI app: avatar/clothing inspect, assemble endpoint, mesh + bone drop forwarding. |
-| `frontend/tests/e2e/*.spec.ts` | Playwright — 17 specs covering compose flow (avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-channel drop UX, blendshape DeformPercent slider, live progress + error events, history view). Auto-starts the dev server and mocks the API. |
+| `tests/test_*.py` | pytest — 394 tests (~13m for the full sweep; the cost is fbx_env bin↔ASCII conversion of the 40MB Maya, not the LLM, which is mocked — most files run in seconds). HTTP mocked, FBX via fixtures. Covers lexer, sections + affinity, edits (incl. drop_mesh + drop/rename blend_shape_channel + rename_mesh/geometry + set_blend_shape_channel_deform_percent), dictionary name translation (`test_naming`, `test_morph_mesh_translation`), validators, cache, merge primitives, Phase A/B/C (incl. cross-merge materials/blendshapes dedup, channel drops, DeformPercent overrides, morph/mesh translation), the API endpoints, the LLM client + streaming NDJSON, and end-to-end on real Maya.fbx. |
+| `tests/test_e2e.py` | Full pipeline against `MockLLMClient`: a PARTIAL synth clothing (one garment mesh, renamed distinct) merged onto maya, then a binary→ASCII round-trip asserts the merge (garment added distinctly, target meshes survive, skeleton repointed not doubled). Reworked from the old byte-identity-to-Maya.fbx check, which the always-merge pivot made obsolete. |
+| `tests/test_api.py` | TestClient against the FastAPI app: avatar/clothing inspect, assemble endpoint, mesh + bone drop forwarding, translate_target_morphs flag. |
+| `frontend/tests/e2e/*.spec.ts` | Playwright — 18 specs covering compose flow (avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-channel drop UX, blendshape DeformPercent slider, target morph-translation checkbox, live progress + error events, history view). Auto-starts the dev server and mocks the API. |
 | `training/smoke_ollama.py` | Manual. Real Ollama, LLM-only (no Phase C). Spits keep/drop summary + validator output. |
 | `training/smoke_full_pipeline.py` | Manual. Real Ollama, full assemble(), fbx_compare vs Maya.fbx (synth-clothing fixture). |
 | `training/smoke_cross_merge_mock.py` | Manual. Mock LLM, exercises Phase C pass-through on a real clothing (ClassicChic_Moe → Moe). Should round-trip structurally identical. |
@@ -207,7 +221,7 @@ Error → one re-prompt with violation text appended → second failure raises.
 
 ## Current results (2026-05-21)
 
-- **Mock LLM end-to-end (synth clothing → maya):** structurally identical to Maya.fbx.
+- **Mock LLM end-to-end (partial synth clothing → maya):** garment mesh added distinctly, target meshes survive, clothing skeleton repointed onto the target (no duplicated bones), binary round-trips cleanly. (Was "structurally identical to Maya.fbx" pre-always-merge; see `test_e2e.py`.)
 - **Mock LLM pass-through (ClassicChic_Moe → moe):** structurally identical to input clothing (node_count, total_clusters, total_skin_weights all match to 1 ULP through bin↔ASCII roundtrip).
 - **Real DS V4 Flash, 5-clothing stress against Maya:** all 5 pass. 877 total limb bones → 542 keep / 335 drop, with **0 drops at `cluster_weight_count > 100`** across the set (no over-pruning of real skinned bones). Validators pass first-try on every run (no re-prompt needed). All 8 required canonical roles assigned in every run. Phase A donor=maya 0.96–1.00. Latency 3–10 min per clothing; 35 min total wall time.
   - Per-clothing detail + manifests: `data/training/_stress/`.
@@ -227,6 +241,7 @@ Error → one re-prompt with violation text appended → second failure raises.
 - **Mesh-level user pre-filter** — `drop_mesh_edits` primitive cleanly strips Mesh-Model + Geometry + Skin + Clusters as one unit. Endpoint accepts `drop_mesh_ids` + `target_drop_mesh_ids`; Phase C applies them in both pass-through and cross-merge.
 - **Blendshape-channel user pre-filter** — `drop_blend_shape_channel_edits` primitive strips a BlendShapeChannel SubDeformer + connections referencing it (owning BlendShape Deformer preserved — may hold surviving siblings). Inspect surfaces `blend_shape_channels[]`; assemble accepts `drop_blend_shape_channel_ids` + `target_drop_blend_shape_channel_ids`; FE renders a flat per-channel checkbox list with a name filter (channels number in the hundreds on real avatars).
 - **DeformPercent override (blendshape slider)** — `set_blend_shape_channel_deform_percent_edits` primitive rewrites just the numeric `DeformPercent` token on a BlendShapeChannel (matches Maya's int-vs-%g formatting so diffs stay clean). Inspect returns each channel's on-disk `deform_percent` so the FE slider opens at the file's actual baseline. Assemble accepts `blend_shape_channel_overrides` + `target_blend_shape_channel_overrides` (list of `{channel_id, deform_percent}`). Channels in the corresponding drop set are silently skipped — drop wins. FE: 0-100 range slider beside each channel checkbox; snapping back to the on-disk value clears the override (keeps payloads clean); current value highlights yellow when overridden.
+- **JP/KR→EN name translation** — makes non-English Booth assets readable. Two halves: (1) **bones** — the LLM emits a per-bone `name_en` (schema **v2.2**); `EditPlan` renames ride-along non-canonical bones to it. (2) **morphs + meshes** — `rigforge/naming.py` does a deterministic, offline dictionary lookup (`data/name_translation.json`, no LLM) for blendshape-channel, mesh (Model), and mesh-DATA (Geometry) names; `phase_c._translate_morph_and_mesh_edits` applies the renames via `rename_blend_shape_channel_edits` / `rename_mesh_edits` / `rename_geometry_edits`. `translate_name` peels laterality (`_L`/`_R`/`右`/`左`) + index tails (incl. full-width digits) and a bare trailing `L`/`R`, with an NFKC fallback for half-width katakana. Collisions are allowed (a smile spanning mouth+eyes+cheeks can legitimately share a name — no forced uniqueness). Safe because FBX wires by object id, not name. Clothing always translates; the target (base avatar) is behind `translate_target_morphs` (FE checkbox in `TargetPanel.vue`, default on) for the rare downstream-Unity-binds-by-name case. Coverage on Maya's morph set: 142/147; the rest are symbol/Greek mouth visemes left for human labels.
 - **Live assemble progress** — `assemble()` in `pipeline/orchestrator.py` takes an optional `progress_cb(phase, note)` invoked at phase boundaries. New `POST /api/assemble/stream` runs the pipeline on a worker thread and emits NDJSON events (`started` / `progress` / `heartbeat` / `done` / `error`) for the FE to read line-by-line. FE's `AssembleProgressList.vue` shows a 4-phase bar + most recent note per clothing in flight. Sync `POST /api/assemble` kept for CLI/scripted callers.
 - **Bone affinity helper** — `bone_to_mesh_names(view, bone_id)` walks the bone subtree (chain-root case) and the cluster→skin→geometry→model chain, filtering out the zero-weight clusters that Maya's rigging convention inserts. The inspect endpoint returns this per bone so power-user tooling has the right `bone → meshes` map.
 - **`user_drop_bone_ids` pre-filter in Phase B** — forces verdict=drop on user-checked bones and cascades to their subtree; the drop_safety validator skips `drop_category="user_dropped"` so high-weight user drops don't error.

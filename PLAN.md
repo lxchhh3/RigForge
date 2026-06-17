@@ -209,6 +209,8 @@ D:/2files/models/vrc/CC/Blender-MHWilds/
 | Bone reparent (chain restructure) | no — validator hard-fails the case | yes (landed) |
 | Materials, blendshapes (parsers + dedup primitives + Phase C integration) | no | yes (landed) |
 | Fingers, twist bones in canonical | no | yes (schema v2.1) |
+| JP/KR→EN name translation — bones (LLM `name_en`, schema v2.2) | no | yes (landed) |
+| JP/KR→EN name translation — morphs + meshes (dictionary, no LLM; FE checkbox for target) | no | yes (landed) |
 | CLI front door (`assemble`, `inspect`) | yes | + `serve` |
 | FastAPI bridge | no | yes (landed) |
 | Compose UI: avatar pick → clothing list → mesh-level drops → assemble | no | yes (landed — v2's user-facing deliverable) |

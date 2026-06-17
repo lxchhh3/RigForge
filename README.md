@@ -64,6 +64,6 @@ cd frontend && npm run test:e2e   # 17 Playwright tests (~2 sec, mocked API)
 
 ## Status
 
-v2 is complete. Bone reparenting, fingers/twist schema, materials/blendshapes dedup in Phase C cross-merge, compose UI, mesh-level + blendshape-channel user pre-filter, per-channel DeformPercent override slider, streaming-progress assemble endpoint + FE progress bar, and the FastAPI bridge are all shipped.
+v2 is complete. Bone reparenting, fingers/twist schema, materials/blendshapes dedup in Phase C cross-merge, JP/KR→EN name translation (bones via LLM `name_en`; morph/mesh names via an offline dictionary, with an FE checkbox for the base avatar), compose UI, mesh-level + blendshape-channel user pre-filter, per-channel DeformPercent override slider, streaming-progress assemble endpoint + FE progress bar, and the FastAPI bridge are all shipped.
 
 Stress validation: zero-shot DeepSeek V4 Flash classified 877 bones across 5 real Maya-rigged clothings with 0 high-weight drops and no validator re-prompts. Details in `data/training/_stress/REPORT.md` (gitignored — generated locally).
