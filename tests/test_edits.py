@@ -14,7 +14,9 @@ from rigforge.ascii_fbx.edits import (
     drop_cluster_edits,
     drop_mesh_edits,
     drop_node_edit,
+    rename_blend_shape_channel_edits,
     rename_bone_edits,
+    rename_mesh_edits,
     set_blend_shape_channel_deform_percent_edits,
 )
 from rigforge.ascii_fbx.lexer import parse
@@ -603,3 +605,81 @@ def test_rename_on_real_maya_then_reparse(maya_fbx_ascii: Path):
     assert "Hips" not in out_by_name
     # Original hierarchy preserved: Spine still parents under Hips's id
     assert out_view.bones[hips.model_id].name == "PELVIS"
+
+
+# --- morph (blendshape channel) + mesh name renames --------------------------
+
+# Mesh Model 100 owns Geometry 300 and a BlendShape (800) with two channels.
+# Channel names are non-English (so .encode is required; a bytes literal can't
+# hold them). Bone 101 is a LimbNode (not a mesh) for the negative cases.
+MORPH_MESH_FBX = (
+    "; FBX 7.4.0 project file\n"
+    "Objects:  {\n"
+    '\tModel: 100, "Model::Body", "Mesh" {\n'
+    "\t}\n"
+    '\tModel: 101, "Model::Hips", "LimbNode" {\n'
+    "\t}\n"
+    '\tGeometry: 300, "Geometry::BodyShape", "Mesh" {\n'
+    "\t}\n"
+    '\tDeformer: 800, "Deformer::BodyBlend", "BlendShape" {\n'
+    "\t\tVersion: 100\n"
+    "\t}\n"
+    '\tDeformer: 900, "SubDeformer::笑い", "BlendShapeChannel" {\n'
+    "\t\tVersion: 100\n"
+    "\t\tDeformPercent: 0\n"
+    "\t}\n"
+    '\tDeformer: 901, "SubDeformer::まばたき2", "BlendShapeChannel" {\n'
+    "\t\tVersion: 100\n"
+    "\t\tDeformPercent: 0\n"
+    "\t}\n"
+    "}\n"
+    "Connections:  {\n"
+    '\tC: "OO",100,0\n'
+    '\tC: "OO",101,0\n'
+    '\tC: "OO",300,100\n'
+    '\tC: "OO",800,300\n'
+    '\tC: "OO",900,800\n'
+    '\tC: "OO",901,800\n'
+    "}\n"
+).encode("utf-8")
+
+
+def test_rename_blend_shape_channel_basic():
+    view = extract(parse(MORPH_MESH_FBX))
+    edits = rename_blend_shape_channel_edits(view, 900, "Smile")
+    out = apply_edits(MORPH_MESH_FBX, edits)
+
+    out_view = extract(parse(out))
+    assert out_view.blend_shape_channels[900].name == "Smile"
+    assert out_view.blend_shape_channels[900].full_name == "SubDeformer::Smile"
+    # The other channel is untouched.
+    assert out_view.blend_shape_channels[901].name == "まばたき2"
+
+
+def test_rename_blend_shape_channel_stale_id_is_noop():
+    view = extract(parse(MORPH_MESH_FBX))
+    assert rename_blend_shape_channel_edits(view, 99999, "X") == []
+
+
+def test_rename_mesh_renames_model_and_geometry():
+    view = extract(parse(MORPH_MESH_FBX))
+    edits = rename_mesh_edits(view, 100, "Torso")
+    out = apply_edits(MORPH_MESH_FBX, edits)
+
+    out_view = extract(parse(out))
+    assert out_view.bones[100].name == "Torso"
+    assert out_view.bones[100].full_name == "Model::Torso"
+    # The owned geometry is renamed to match (kept consistent with the model).
+    assert out_view.geometries[300].name == "Torso"
+    assert out_view.geometries[300].full_name == "Geometry::Torso"
+
+
+def test_rename_mesh_on_non_mesh_model_is_noop():
+    view = extract(parse(MORPH_MESH_FBX))
+    # 101 is a LimbNode bone, not a Mesh-type Model.
+    assert rename_mesh_edits(view, 101, "X") == []
+
+
+def test_rename_mesh_stale_id_is_noop():
+    view = extract(parse(MORPH_MESH_FBX))
+    assert rename_mesh_edits(view, 99999, "X") == []

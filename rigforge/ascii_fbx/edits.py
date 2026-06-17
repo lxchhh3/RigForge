@@ -520,6 +520,103 @@ def rename_bone_edits(
     return edits
 
 
+def rename_blend_shape_channel_edits(
+    view: SectionView,
+    channel_id: int,
+    new_name: str,
+) -> list[TextEdit]:
+    """Edits to rename a BlendShapeChannel SubDeformer (a morph) in place.
+
+    Rewrites the channel's quoted `"SubDeformer::<old>"` to `<...>::<new_name>`
+    (preserving whatever prefix the file used). Morphs are wired into the FBX by
+    object id, not by name, so the name is a cosmetic label — renaming it keeps
+    the file self-consistent (same as `rename_bone_edits` for bones). The paired
+    shape Geometry is intentionally NOT touched: it's an internal node the user
+    never sees, and leaving it keeps the edit minimal.
+
+    Returns [] if `channel_id` isn't a channel in the view, so a stale FE id
+    can't break the run.
+    """
+    ch = view.blend_shape_channels.get(channel_id)
+    if ch is None:
+        return []
+    source = view.document.source
+    return [_replace_quoted_in_args(
+        ch.node_ref, source,
+        f'"{ch.full_name}"'.encode("utf-8"),
+        f'"{_renamed_full(ch.full_name, "SubDeformer", new_name)}"'.encode("utf-8"),
+    )]
+
+
+def rename_mesh_edits(
+    view: SectionView,
+    mesh_model_id: int,
+    new_name: str,
+) -> list[TextEdit]:
+    """Edits to rename a mesh in place: the Mesh-type Model's `"Model::<old>"`
+    plus every Geometry it owns (`"Geometry::<old>"`), all set to `new_name`.
+
+    Naming the owned Geometry to match the Model keeps the two consistent (the
+    Model name is what shows in the outliner; the Geometry name is internal) —
+    same spirit as `rename_bone_edits` renaming a bone's clusters to match.
+
+    Returns [] if `mesh_model_id` isn't a Mesh-type Model in the view, so a
+    stale id no-ops rather than raising.
+    """
+    bone = view.bones.get(mesh_model_id)
+    if bone is None or bone.type_class != "Mesh":
+        return []
+    source = view.document.source
+    edits: list[TextEdit] = [_replace_quoted_in_args(
+        bone.node_ref, source,
+        f'"{bone.full_name}"'.encode("utf-8"),
+        f'"{_renamed_full(bone.full_name, "Model", new_name)}"'.encode("utf-8"),
+    )]
+    for gid, owner in view.geometry_owner_model.items():
+        if owner != mesh_model_id:
+            continue
+        g = view.geometries.get(gid)
+        if g is None:
+            continue
+        edits.append(_replace_quoted_in_args(
+            g.node_ref, source,
+            f'"{g.full_name}"'.encode("utf-8"),
+            f'"{_renamed_full(g.full_name, "Geometry", new_name)}"'.encode("utf-8"),
+        ))
+    return edits
+
+
+def rename_geometry_edits(
+    view: SectionView,
+    geometry_id: int,
+    new_name: str,
+) -> list[TextEdit]:
+    """Edits to rename a single Geometry node's `"Geometry::<old>"` in place.
+
+    Use when a mesh's Model name is already readable but its mesh-DATA name
+    isn't (common: a Korean/Japanese Blender user exports a mesh whose object
+    name is ASCII but whose mesh-data keeps Blender's localized default like
+    `평면.050` / `平面.050`). Renames only the Geometry; the owning Model is
+    untouched. Returns [] for a stale id.
+    """
+    g = view.geometries.get(geometry_id)
+    if g is None:
+        return []
+    source = view.document.source
+    return [_replace_quoted_in_args(
+        g.node_ref, source,
+        f'"{g.full_name}"'.encode("utf-8"),
+        f'"{_renamed_full(g.full_name, "Geometry", new_name)}"'.encode("utf-8"),
+    )]
+
+
+def _renamed_full(full_name: str, default_prefix: str, new_short: str) -> str:
+    """Build a new `Prefix::<new_short>` full name, preserving the original
+    node's prefix (e.g. 'SubDeformer', 'Model', 'Geometry') when present."""
+    prefix = full_name.rsplit("::", 1)[0] if "::" in full_name else default_prefix
+    return f"{prefix}::{new_short}"
+
+
 def _replace_quoted_in_args(
     node: FBXNode,
     source: bytes,

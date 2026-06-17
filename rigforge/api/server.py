@@ -77,6 +77,11 @@ class AssembleRequest(BaseModel):
     # set are ignored (the node is gone before override would apply).
     blend_shape_channel_overrides: list[ChannelOverride] = []
     target_blend_shape_channel_overrides: list[ChannelOverride] = []
+    # Translate the base avatar's own morph + mesh names to English. Clothing
+    # names are always translated; this checkbox controls the TARGET only, for
+    # the rare case a downstream Unity project binds the base avatar's morphs
+    # by name. Defaults on.
+    translate_target_morphs: bool = True
 
 
 def _build_inspect_response(
@@ -382,6 +387,7 @@ def create_app(
             "target_drop_blend_shape_channel_ids": target_drop_channels,
             "blend_shape_channel_overrides": channel_overrides,
             "target_blend_shape_channel_overrides": target_channel_overrides,
+            "translate_target_morphs": req.translate_target_morphs,
         }
         return clothing_path, out_fbx, stem, kwargs
 

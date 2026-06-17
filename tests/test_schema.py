@@ -12,7 +12,7 @@ def schema() -> CanonicalSchema:
 
 
 def test_loads_default(schema: CanonicalSchema):
-    assert schema.version == "2.1"
+    assert schema.version == "2.2"
     assert "Hips" in schema.roles
     assert "Head" in schema.roles
 

@@ -65,6 +65,7 @@ def cmd_assemble(args) -> int:
             schema=schema,
             llm_client=llm,
             cache=cache,
+            translate_target_morphs=not args.no_translate_target_morphs,
         )
     except PipelineError as e:
         print(f"pipeline failed: {e}", file=sys.stderr)
@@ -168,6 +169,9 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--schema", help="path to canonical_schema.json")
     a.add_argument("--cache-dir", help="decision cache root (default: ./cache)")
     a.add_argument("--manifest", help="output path for the run manifest JSON")
+    a.add_argument("--no-translate-target-morphs", action="store_true",
+                   help="keep the base avatar's original (untranslated) morph + "
+                        "mesh names; clothing names are always translated")
     llm_group = a.add_mutually_exclusive_group()
     llm_group.add_argument("--llm-mock", help="path to a fixture decisions JSON (MockLLMClient)")
     llm_group.add_argument(

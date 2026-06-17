@@ -39,7 +39,10 @@ from rigforge.ascii_fbx.edits import (
     drop_bone_edits,
     drop_mesh_edits,
     drop_node_edit,
+    rename_blend_shape_channel_edits,
     rename_bone_edits,
+    rename_geometry_edits,
+    rename_mesh_edits,
     set_blend_shape_channel_deform_percent_edits,
 )
 from rigforge.ascii_fbx.lexer import parse as parse_fbx
@@ -52,12 +55,96 @@ from rigforge.ascii_fbx.merge import (
 from rigforge.ascii_fbx.sections import SectionView, _extract_props_vec3, extract
 from rigforge.avatars.registry import AvatarRegistry, CuratedAvatar
 from rigforge.canonical.decisions import DecisionSet
+from rigforge.naming import load_translation_table, translate_name
 
 from .edit_plan import EditPlan
 
 
 class PhaseCError(RuntimeError):
     pass
+
+
+def _translate_morph_and_mesh_edits(
+    view: SectionView,
+    table: dict[str, str],
+    *,
+    skip_channel_ids: set[int],
+    skip_mesh_ids: set[int],
+    notes: list[str],
+    side: str,
+) -> list[TextEdit]:
+    """Rename every blendshape channel (morph) + mesh in `view` whose name has
+    a dictionary translation, to its readable English form.
+
+    Deterministic and offline (no LLM): a JP/KR morph like 笑い becomes Smile,
+    a mesh 髪 becomes Hair. Names with no entry (or already-English ones) keep
+    their original. Collisions are allowed by design — distinct morphs that
+    serve one function may share a translated name; we never disambiguate.
+
+    Skips ids in `skip_*` (the channels/meshes the caller is dropping) so a
+    rename never overlaps a drop edit. Iterates the view's OWN ids — never
+    FE-supplied ids — so there's no id-source mismatch to worry about. Inside
+    the FBX, morphs/meshes are wired by id, not name, so these renames are pure
+    cosmetic relabels and keep the file self-consistent.
+    """
+    edits: list[TextEdit] = []
+    n_ch = 0
+    for cid, ch in view.blend_shape_channels.items():
+        if cid in skip_channel_ids:
+            continue
+        en = translate_name(ch.name, table)
+        if en is None or en == ch.name:
+            continue
+        ce = rename_blend_shape_channel_edits(view, cid, en)
+        if ce:
+            edits.extend(ce)
+            n_ch += 1
+
+    # Meshes: prefer the Model (object) name. When it translates, rename the
+    # whole mesh (Model + its geometries) and mark those geometries handled.
+    n_mesh = 0
+    handled_geoms: set[int] = set()
+    geoms_of: dict[int, list[int]] = {}
+    for gid, owner in view.geometry_owner_model.items():
+        geoms_of.setdefault(owner, []).append(gid)
+    for mid, b in view.bones.items():
+        if b.type_class != "Mesh" or mid in skip_mesh_ids:
+            continue
+        en = translate_name(b.name, table)
+        if en is None or en == b.name:
+            continue
+        me = rename_mesh_edits(view, mid, en)
+        if me:
+            edits.extend(me)
+            handled_geoms.update(geoms_of.get(mid, ()))
+            n_mesh += 1
+
+    # Mesh-DATA names: a mesh whose Model name is already English can still
+    # carry a non-English Geometry name (Korean/JP Blender default like
+    # `평면.050`). Translate those by their OWN name. Skip shape geometries
+    # (they're not in geometry_owner_model) and geometries already renamed via
+    # their Model above, and meshes being dropped.
+    n_geom = 0
+    for gid, owner in view.geometry_owner_model.items():
+        if owner in skip_mesh_ids or gid in handled_geoms:
+            continue
+        g = view.geometries.get(gid)
+        if g is None:
+            continue
+        en = translate_name(g.name, table)
+        if en is None or en == g.name:
+            continue
+        ge = rename_geometry_edits(view, gid, en)
+        if ge:
+            edits.extend(ge)
+            n_geom += 1
+
+    if n_ch or n_mesh or n_geom:
+        notes.append(
+            f"translate ({side}): {n_ch} morphs + {n_mesh} meshes + "
+            f"{n_geom} mesh-data names -> EN"
+        )
+    return edits
 
 
 def _find_target_armature_null(target_view: SectionView) -> Optional[int]:
@@ -116,6 +203,7 @@ def run_phase_c(
     target_drop_blend_shape_channel_ids: Optional[set[int]] = None,
     blend_shape_channel_overrides: Optional[dict[int, float]] = None,
     target_blend_shape_channel_overrides: Optional[dict[int, float]] = None,
+    translate_target_morphs: bool = True,
 ) -> PhaseCResult:
     """Apply EditPlan to clothing ASCII, then merge with target if needed.
 
@@ -138,6 +226,11 @@ def run_phase_c(
     without needing an animation track to drive it. Channels in the drop
     set are dropped before overrides apply — override on a dropped id is a
     no-op (the node is gone).
+    `translate_target_morphs` (default True): also translate the TARGET
+    (base-avatar) morph + mesh names to English. Clothing-side names are
+    ALWAYS translated (no external name binding to break); the target's are
+    behind this flag — the FE checkbox — for the rare case where a downstream
+    Unity project binds the base avatar's morphs by name.
     """
     notes: list[str] = []
 
@@ -177,6 +270,7 @@ def run_phase_c(
         target_drop_blend_shape_channel_ids=target_drop_blend_shape_channel_ids or set(),
         blend_shape_channel_overrides=blend_shape_channel_overrides or {},
         target_blend_shape_channel_overrides=target_blend_shape_channel_overrides or {},
+        translate_target_morphs=translate_target_morphs,
         notes=notes,
     )
     return PhaseCResult(merged_ascii=merged, notes=notes)
@@ -278,6 +372,7 @@ def _run_merge(
     target_drop_blend_shape_channel_ids: set[int],
     blend_shape_channel_overrides: dict[int, float],
     target_blend_shape_channel_overrides: dict[int, float],
+    translate_target_morphs: bool,
     notes: list[str],
 ) -> bytes:
     # `repoint_table` + `kept_bone_ids` come pre-built from one of the two
@@ -411,6 +506,18 @@ def _run_merge(
                 f"override: set DeformPercent on {applied} clothing channels"
             )
 
+    # Translate clothing morph + mesh names to English — ALWAYS. Clothing names
+    # have no external name binding to break (RigForge produces a real FBX, not
+    # a name-bound Unity/Modular-Avatar setup), so this is a pure readability
+    # win. Loaded once here; the target side reuses the same table below.
+    translation_table = load_translation_table()
+    strip_edits.extend(_translate_morph_and_mesh_edits(
+        clothing_view, translation_table,
+        skip_channel_ids=drop_blend_shape_channel_ids,
+        skip_mesh_ids=drop_mesh_ids,
+        notes=notes, side="clothing",
+    ))
+
     strip_edits = _dedupe_edits(strip_edits)
     stripped = apply_edits(clothing_ascii, strip_edits)
     notes.append(f"strip: dropped {len(kept_bone_ids)} kept-bone models + "
@@ -445,6 +552,7 @@ def _run_merge(
         or target_drop_mesh_ids
         or target_drop_blend_shape_channel_ids
         or target_blend_shape_channel_overrides
+        or translate_target_morphs
     ):
         target_drop_edits: list[TextEdit] = []
         for bid in target_drop_bone_ids:
@@ -479,6 +587,15 @@ def _run_merge(
             if channel_edits:
                 target_drop_edits.extend(channel_edits)
                 target_override_applied += 1
+        # Translate the base avatar's own morph + mesh names — only when the FE
+        # checkbox is on. Skip ids being dropped above so no edit overlaps.
+        if translate_target_morphs:
+            target_drop_edits.extend(_translate_morph_and_mesh_edits(
+                target_view, translation_table,
+                skip_channel_ids=target_drop_blend_shape_channel_ids,
+                skip_mesh_ids=target_drop_mesh_ids,
+                notes=notes, side="target",
+            ))
         target_drop_edits = _dedupe_edits(target_drop_edits)
         target_ascii = apply_edits(target_ascii, target_drop_edits)
         notes.append(

@@ -6,7 +6,7 @@ import MeshList from './MeshList.vue'
 import BlendShapeList from './BlendShapeList.vue'
 
 const compose = useComposeStore()
-const { target } = storeToRefs(compose)
+const { target, translateTargetMorphs } = storeToRefs(compose)
 
 const meshCount = computed(() =>
   target.value.inspect
@@ -38,6 +38,14 @@ const channelCount = computed(() =>
         <strong>{{ target.avatarId }}</strong> — {{ meshCount }} meshes,
         {{ channelCount }} blendshapes
       </div>
+      <label class="opt" data-testid="translate-target-morphs">
+        <input type="checkbox" v-model="translateTargetMorphs" />
+        <span class="opt-label">Translate this avatar's morph &amp; mesh names to English</span>
+        <span class="opt-hint">
+          Clothing names are always translated. Turn this off only if a
+          downstream Unity project binds the base avatar's morphs by name.
+        </span>
+      </label>
       <div class="tree-wrap">
         <MeshList :source="target" armature-label="Armature" />
       </div>
@@ -88,6 +96,26 @@ const channelCount = computed(() =>
 .meta strong {
   color: #ddd;
   font-weight: 600;
+}
+.opt {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 0.1rem 0.5rem;
+  margin: 0 0 0.6rem 0;
+  cursor: pointer;
+}
+.opt input {
+  grid-row: 1 / span 2;
+  align-self: center;
+}
+.opt-label {
+  color: #ddd;
+  font-size: 0.85rem;
+}
+.opt-hint {
+  color: #888;
+  font-size: 0.75rem;
 }
 .tree-wrap {
   max-height: 320px;

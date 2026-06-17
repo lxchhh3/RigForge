@@ -73,6 +73,7 @@ def assemble(
     target_drop_blend_shape_channel_ids: Optional[set[int]] = None,
     blend_shape_channel_overrides: Optional[dict[int, float]] = None,
     target_blend_shape_channel_overrides: Optional[dict[int, float]] = None,
+    translate_target_morphs: bool = True,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> PipelineRun:
     """Run the full assembly pipeline and write the deliverable binary FBX.
@@ -151,6 +152,7 @@ def assemble(
         target_drop_blend_shape_channel_ids=target_drop_blend_shape_channel_ids,
         blend_shape_channel_overrides=blend_shape_channel_overrides,
         target_blend_shape_channel_overrides=target_blend_shape_channel_overrides,
+        translate_target_morphs=translate_target_morphs,
     )
     _emit("phase_c", "merge complete")
 

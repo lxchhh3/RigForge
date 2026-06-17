@@ -509,3 +509,42 @@ test('FE drops survive a page reload (localStorage persistence)', async ({ page 
   await expect(page.getByTestId('target-panel').locator('[data-mesh-name="Shoes"]'))
     .toHaveAttribute('data-state', 'kept')
 })
+
+test('translate-target-morphs checkbox is on by default and forwards true', async ({ page }) => {
+  await mockApi(page)
+  const assembleRequests: unknown[] = []
+  await captureAssembleRequests(page, assembleRequests)
+
+  await page.goto('/')
+
+  // The option lives on the target panel (it controls the base avatar's names).
+  const opt = page.getByTestId('translate-target-morphs').locator('input[type=checkbox]')
+  await expect(opt).toBeChecked()
+
+  // Add a clothing so assemble is enabled, then assemble.
+  await page.getByTestId('clothing-path-input').fill('C:/fixtures/classic_chic.fbx')
+  await page.getByTestId('clothing-add-button').click()
+  await page.getByTestId('assemble-button').click()
+  await expect(page.getByTestId('assemble-result').first()).toBeVisible()
+
+  const body = assembleRequests[0] as { translate_target_morphs: boolean }
+  expect(body.translate_target_morphs).toBe(true)
+})
+
+test('unchecking translate-target-morphs forwards false', async ({ page }) => {
+  await mockApi(page)
+  const assembleRequests: unknown[] = []
+  await captureAssembleRequests(page, assembleRequests)
+
+  await page.goto('/')
+
+  await page.getByTestId('translate-target-morphs').locator('input[type=checkbox]').uncheck()
+
+  await page.getByTestId('clothing-path-input').fill('C:/fixtures/classic_chic.fbx')
+  await page.getByTestId('clothing-add-button').click()
+  await page.getByTestId('assemble-button').click()
+  await expect(page.getByTestId('assemble-result').first()).toBeVisible()
+
+  const body = assembleRequests[0] as { translate_target_morphs: boolean }
+  expect(body.translate_target_morphs).toBe(false)
+})

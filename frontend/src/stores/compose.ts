@@ -114,12 +114,17 @@ interface PersistedSelection {
 }
 interface PersistedSnapshot {
   targetId: string | null
+  translateTargetMorphs?: boolean
   target: ({ avatarId: string | null } & PersistedSelection) | null
   clothings: ({ path: string } & PersistedSelection)[]
 }
 
 export const useComposeStore = defineStore('compose', () => {
   const targetId = ref<string | null>(null)
+  // Translate the base avatar's own morph + mesh names to English. Clothing
+  // names are always translated by the backend; this checkbox is the target's
+  // opt-out for the rare downstream-Unity-binds-by-name case. Default on.
+  const translateTargetMorphs = ref(true)
   const clothings = reactive<ComposedClothing[]>([])
   const assembling = ref(false)
   const results = reactive<AssembleResult[]>([])
@@ -310,6 +315,7 @@ export const useComposeStore = defineStore('compose', () => {
             target_drop_blend_shape_channel_ids: targetDropChannelIds,
             blend_shape_channel_overrides: channelOverrides,
             target_blend_shape_channel_overrides: targetChannelOverrides,
+            translate_target_morphs: translateTargetMorphs.value,
           }),
         })
         if (!res.ok) {
@@ -390,6 +396,7 @@ export const useComposeStore = defineStore('compose', () => {
   function snapshot(): PersistedSnapshot {
     return {
       targetId: targetId.value,
+      translateTargetMorphs: translateTargetMorphs.value,
       target: target.avatarId
         ? {
             avatarId: target.avatarId,
@@ -431,6 +438,9 @@ export const useComposeStore = defineStore('compose', () => {
     hydrating = true
     // Restore the picked target + queue its strip for the upcoming inspect.
     if (snap.targetId) targetId.value = snap.targetId
+    if (typeof snap.translateTargetMorphs === 'boolean') {
+      translateTargetMorphs.value = snap.translateTargetMorphs
+    }
     if (snap.target?.avatarId) {
       pendingTargetRestore = {
         avatarId: snap.target.avatarId,
@@ -458,10 +468,11 @@ export const useComposeStore = defineStore('compose', () => {
   hydrate()
   // Deep-watch the selection-bearing state; serialize on any change. inspect
   // payloads aren't in the snapshot, so inspect resolutions don't churn writes.
-  watch([targetId, target, clothings], persist, { deep: true })
+  watch([targetId, translateTargetMorphs, target, clothings], persist, { deep: true })
 
   return {
     targetId,
+    translateTargetMorphs,
     target,
     clothings,
     assembling,
