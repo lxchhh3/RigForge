@@ -128,3 +128,14 @@ def test_shipped_dictionary_loads_and_has_standard_morphs():
     for k, v in table.items():
         assert v.isascii(), f"non-ASCII translation value for {k!r}: {v!r}"
         assert v.strip() == v and v, f"blank/edge-padded value for {k!r}"
+
+
+def test_shipped_dictionary_covers_standard_mmd_morph_set():
+    """The expanded MMD face-morph vocabulary, including compound names that
+    rely on the laterality + index peel."""
+    table = load_translation_table()
+    assert translate_name("瞳右", table) == "Pupil_right"
+    assert translate_name("怒る_L", table) == "Angry_L"
+    assert translate_name("光_上3", table) == "Highlight_up3"
+    assert translate_name("下まつ毛_斜め_L", table) == "Lower_lash_diag_L"
+    assert translate_name("やえば2_R", table) == "Fang2_R"
