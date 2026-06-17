@@ -19,7 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from rigforge.ascii_fbx.edits import apply_edits, rename_bone_edits
+from rigforge.ascii_fbx.edits import (
+    apply_edits,
+    drop_mesh_edits,
+    rename_bone_edits,
+    rename_mesh_edits,
+)
 from rigforge.ascii_fbx.lexer import parse
 from rigforge.ascii_fbx.sections import extract
 from rigforge.avatars.registry import AvatarRegistry
@@ -39,6 +44,8 @@ class SynthBuild:
     decisions_path: Path
     decisions: DecisionSet
     expected_renames: dict[str, str]    # synth_name -> canonical_target_name
+    clothing_mesh_names: tuple[str, ...] = ()  # final names of the kept meshes
+                                               # (empty unless `keep_meshes` set)
 
 
 def build_synth_clothing(
@@ -50,17 +57,50 @@ def build_synth_clothing(
     registry: Optional[AvatarRegistry] = None,
     perturb_targets: tuple[str, ...] = DEFAULT_PERTURB_TARGETS,
     prefix: str = DEFAULT_PREFIX,
+    keep_meshes: Optional[tuple[str, ...]] = None,
+    mesh_rename_prefix: str = "",
 ) -> SynthBuild:
     """Generate the synthetic clothing FBX + matched mock-LLM decisions.
 
     The decisions assign each perturbed bone its canonical role (with the
     target avatar's display name) so Phase B's EditPlan undoes the perturbation.
+
+    `keep_meshes` (optional): carve a PARTIAL clothing out of the source —
+    keep only these meshes (the "garment") and drop every other mesh, so an
+    assemble onto the donor is a real merge (target body + this garment) rather
+    than a degenerate self-double. `mesh_rename_prefix` renames the kept meshes
+    (e.g. `Cloth` -> `SynthCloth`) so they're DISTINCT from the target's
+    same-named meshes — the merge then adds them cleanly instead of colliding.
+    When `keep_meshes` is None (default) the whole source is kept (legacy
+    behavior).
     """
     registry = registry or AvatarRegistry.load_default()
     av = registry.get(avatar)
 
     raw = source_ascii.read_bytes()
     view = extract(parse(raw))
+
+    # Optional partial-clothing carve: keep only `keep_meshes` (renamed distinct
+    # via `mesh_rename_prefix`) and drop the rest. Done as its OWN pass with a
+    # re-parse, so these mesh edits can't overlap the bone-perturbation edits
+    # below — a perturbed spine bone has clusters on the meshes we're dropping,
+    # and renaming a cluster while drop_mesh_edits removes it would collide.
+    clothing_mesh_names: list[str] = []
+    if keep_meshes is not None:
+        keep_set = set(keep_meshes)
+        mesh_edits = []
+        for b in list(view.bones.values()):
+            if b.type_class != "Mesh":
+                continue
+            if b.name in keep_set:
+                new_name = f"{mesh_rename_prefix}{b.name}"
+                clothing_mesh_names.append(new_name)
+                if new_name != b.name:
+                    mesh_edits.extend(rename_mesh_edits(view, b.model_id, new_name))
+            else:
+                mesh_edits.extend(drop_mesh_edits(view, b.model_id))
+        raw = apply_edits(raw, mesh_edits)
+        view = extract(parse(raw))
 
     # Map canonical role -> bone in the source. canonical_to_name gives
     # role -> display_name, and we look that display_name up in the view.
@@ -118,4 +158,5 @@ def build_synth_clothing(
         decisions_path=out_decisions,
         decisions=decisions,
         expected_renames=expected_renames,
+        clothing_mesh_names=tuple(clothing_mesh_names),
     )
