@@ -98,6 +98,36 @@ def test_fullwidth_digit_tail_normalized_to_ascii():
     assert translate_name("まばたき３", TABLE) == "Blink3"
 
 
+# --- bare L/R suffix (no separator) ------------------------------------------
+
+
+def test_bare_lr_suffix_after_nonascii_is_peeled():
+    # MMD morphs like 口角上げL append a bare L/R with no separator.
+    t = {"口角上げ": "Mouth_corner_up"}
+    assert translate_name("口角上げL", t) == "Mouth_corner_up_L"
+    assert translate_name("口角上げR", t) == "Mouth_corner_up_R"
+
+
+def test_bare_lr_not_peeled_after_ascii():
+    # Guard: an English-ish name ending in L/R must NOT be split (the char
+    # before L/R is ASCII), so we don't mangle real names.
+    assert translate_name("WinkR", TABLE) is None
+    assert translate_name("BlinkL", TABLE) is None
+
+
+# --- half-width katakana (NFKC fallback) -------------------------------------
+
+
+def test_halfwidth_katakana_via_nfkc():
+    # ｳｨﾝｸ (half-width) should resolve to the full-width ウィンク entry.
+    assert translate_name("ｳｨﾝｸ", TABLE) == "Wink"
+
+
+def test_halfwidth_katakana_with_index_and_laterality():
+    # ｳｨﾝｸ２右 -> Wink2_R (half-width kana + full-width digit + 右).
+    assert translate_name("ｳｨﾝｸ２右", TABLE) == "Wink2_R"
+
+
 # --- collisions are allowed (no forced uniqueness) --------------------------
 
 

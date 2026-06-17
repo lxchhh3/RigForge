@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -56,18 +57,32 @@ def translate_name(name: Optional[str], table: dict[str, str]) -> Optional[str]:
 
     Tries an exact match first (so a key that literally contains digits/suffixes
     still resolves), then iteratively peels trailing index tails (`まばたき2`,
-    `笑い.001`) and laterality suffixes (`びっくり_R`, `ウィンク右`) off the end,
-    normalizing them (full-width `２` -> `2`, `.R`/`右` -> `_R`), and looks up the
-    bare base. The normalized suffixes are re-attached in original order:
-    `ウィンク２右` -> `Wink2_R`. A base that isn't in the table yields None, so the
-    caller keeps the original name. Never raises on unknown input.
+    `笑い.001`) and laterality suffixes (`びっくり_R`, `ウィンク右`, bare `口角上げL`)
+    off the end, normalizing them (full-width `２` -> `2`, `.R`/`右` -> `_R`), and
+    looks up the bare base. The normalized suffixes are re-attached in original
+    order: `ウィンク２右` -> `Wink2_R`. If that fails, retries on the NFKC-normalized
+    name so half-width katakana (`ｳｨﾝｸ` -> `ウィンク`) resolves. A base that isn't
+    in the table yields None, so the caller keeps the original name. Never raises.
     """
     if not name:
         return None
+    result = _translate_core(name, table)
+    if result is not None:
+        return result
+    # Fallback: normalize compatibility forms (half-width katakana -> full-width,
+    # full-width ASCII -> ASCII, ...) and retry. Only reached when the raw name
+    # didn't resolve, so well-formed names never pay for it.
+    normalized = unicodedata.normalize("NFKC", name)
+    if normalized != name:
+        return _translate_core(normalized, table)
+    return None
+
+
+def _translate_core(name: str, table: dict[str, str]) -> Optional[str]:
+    """Exact match, else peel trailing suffixes and look up the bare base."""
     hit = table.get(name)
     if hit is not None:
         return hit
-
     base = name
     suffix = ""
     while True:
@@ -76,7 +91,6 @@ def translate_name(name: Optional[str], table: dict[str, str]) -> Optional[str]:
             break
         base, normalized = peeled
         suffix = normalized + suffix
-
     if base != name:
         base_hit = table.get(base)
         if base_hit is not None:
@@ -92,6 +106,11 @@ def _peel_suffix(s: str) -> Optional[tuple[str, str]]:
     for raw, norm in _LATERAL_SUFFIXES:
         if s.endswith(raw) and len(s) > len(raw):
             return s[: -len(raw)], norm
+    # Bare trailing L/R with no separator (e.g. 口角上げL). Only when preceded by
+    # a non-ASCII char, so we never split an English name that happens to end in
+    # L/R — that boundary is the MMD-morph convention, not an English word.
+    if len(s) >= 2 and s[-1] in ("L", "R") and ord(s[-2]) > 127:
+        return s[:-1], f"_{s[-1]}"
     m = _INDEX_RE.match(s)
     if m and m.group("digits"):
         digits = m.group("digits").translate(_FW_TO_ASCII_DIGITS)
