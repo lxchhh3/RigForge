@@ -20,6 +20,8 @@ from rigforge.avatars.registry import (
 from rigforge.canonical.decisions import Decision, DecisionSet
 from rigforge.canonical.schema import CanonicalSchema
 from rigforge.llm.mock import MockLLMClient
+from rigforge.ascii_fbx.transform import LocalTransform
+from rigforge.pipeline.bone_transforms import BoneTransformEdit
 from rigforge.pipeline.edit_plan import EditPlan
 from rigforge.pipeline.phase_a import run_phase_a
 from rigforge.pipeline.phase_b import PhaseBError, run_phase_b
@@ -69,6 +71,27 @@ Connections:  {
     with pytest.raises(DonorIdentificationError) as exc:
         run_phase_a(fake, registry, work_dir=tmp_path)
     assert exc.value.top_candidates
+
+
+def test_phase_a_passes_a_rigid_garment_through(registry, rigid_garment_fbx: Path, tmp_path: Path):
+    """No bones = nothing to match a donor on: GG_headset scored 0.000 and
+    killed the whole compose. A bone-less garment is RIGID — Phase A flags it
+    and hands back the target as its donor instead of raising."""
+    a = run_phase_a(rigid_garment_fbx, registry, work_dir=tmp_path,
+                    target_id="maya")
+    assert a.rigid
+    assert a.donor_id == "maya"
+    assert a.candidates == []
+    assert [b.name for b in a.view.bones_of_type("Mesh")] == ["Visor"]
+
+
+def test_phase_a_rigid_garment_needs_a_target(registry, rigid_garment_fbx: Path, tmp_path: Path):
+    with pytest.raises(DonorIdentificationError, match="no bones"):
+        run_phase_a(rigid_garment_fbx, registry, work_dir=tmp_path)
+
+
+def test_phase_a_rigged_garment_is_not_rigid(maya_fbx_ascii: Path, registry, tmp_path: Path):
+    assert not run_phase_a(maya_fbx_ascii, registry, work_dir=tmp_path).rigid
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +341,83 @@ def test_phase_b_validation_failure_raises(maya_fbx_ascii: Path, registry, schem
         run_phase_b(view=view, donor_id="maya", target_id="maya",
                     registry=registry, schema=schema, llm_client=mock)
     assert exc.value.violations
+
+
+# --- Partial garments (a real stockings FBX carries only the lower body) ------
+
+
+def _lower_body_view(view):
+    """Cut the Maya view down to the skeleton a legs-only garment ships with:
+    Hips/Spine/Chest + both full leg chains — the exact bone set of the
+    Maya_Stocking.fbx that first hit this case. Non-limb nodes (meshes, the
+    Armature null) are left alone; children lists are trimmed so the pruned
+    view stays internally consistent."""
+    import dataclasses
+    av = AvatarRegistry.load_default().get("maya")
+    keep_roles = {
+        "Hips", "Spine", "Chest",
+        "UpperLeg.L", "LowerLeg.L", "Foot.L", "Toes.L",
+        "UpperLeg.R", "LowerLeg.R", "Foot.R", "Toes.R",
+    }
+    keep_names = {av.canonical_to_name[r] for r in keep_roles}
+    keep_ids = {b.model_id for b in view.limb_bones() if b.name in keep_names}
+    assert len(keep_ids) == len(keep_roles), "fixture broken: Maya lacks a leg/spine bone"
+    bones = {}
+    for bid, b in view.bones.items():
+        if b.type_class == "LimbNode" and bid not in keep_ids:
+            continue
+        kept_children = [
+            (cid, cname) for cid, cname in zip(b.children_ids, b.child_names)
+            if cid in keep_ids
+            or (cid in view.bones and view.bones[cid].type_class != "LimbNode")
+        ]
+        bones[bid] = dataclasses.replace(
+            b,
+            children_ids=[c for c, _ in kept_children],
+            child_names=[n for _, n in kept_children],
+        )
+    return dataclasses.replace(view, bones=bones)
+
+
+class _CountingMock(MockLLMClient):
+    """MockLLMClient that counts classify() calls — a re-prompt shows as 2."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calls = 0
+
+    def classify(self, request):
+        self.calls += 1
+        return super().classify(request)
+
+
+def test_phase_b_partial_garment_passes_without_reprompt(
+    maya_fbx_ascii: Path, registry, schema,
+):
+    """Legs-only garment → Head/UpperArm.* have no bone at all. Phase B must
+    accept the first classification (no re-prompt: nothing the LLM could
+    change) and surface the absent required roles as warnings, not raise.
+    Real-world trigger: Maya_Stocking.fbx died with "required role 'Head'
+    has no kept bone" (2026-09-20)."""
+    view = _lower_body_view(extract(parse(maya_fbx_ascii.read_bytes())))
+    decisions = _maya_identity_decisions(view)
+    roles = {d.role for d in decisions.bones}
+    assert "Head" not in roles and "UpperArm.L" not in roles  # fixture sanity
+    mock = _CountingMock(decisions, model_id="test-partial")
+
+    result = run_phase_b(
+        view=view, donor_id="maya", target_id="maya",
+        registry=registry, schema=schema, llm_client=mock,
+    )
+
+    assert mock.calls == 1, "absent required roles must not trigger the re-prompt"
+    absent = sorted(
+        v.message.split("'")[1] for v in result.warnings
+        if v.rule == "required_roles_present"
+    )
+    assert absent == ["Head", "UpperArm.L", "UpperArm.R"]
+    assert result.edit_plan.renames == {}
+    assert not result.edit_plan.drops
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +1004,74 @@ def test_phase_c_passthrough_drops_clothing_meshes(
     extract(parse(dropped.merged_ascii))
 
 
+def test_phase_c_cross_avatar_mesh_drop_wins_over_ride_along_bone_rename(
+    maya_fbx_ascii: Path, registry,
+):
+    """Dropping a clothing mesh must beat a rename that lands inside it.
+
+    `rename_bone_edits` rewrites the `SubDeformer::<name>` token on every
+    cluster of a renamed ride-along bone. When one of those clusters belongs to
+    a mesh the modder unchecked, `drop_mesh_edits` deletes that whole Cluster
+    block — so the rename edit sits *inside* a deleted range and `apply_edits`
+    rejected the pair as overlapping, killing the entire assemble.
+
+    Regression for the 2026-09-03 N045_12 report: unchecking
+    `4.Stocking_fishnet(Optional)` died with
+    `EditError: overlapping edits at offset 193733574` because the renamed
+    ride-along bone `Skirt_L.004(IG)` also skinned that mesh.
+    """
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+
+    def _clusters_of(mesh_model_id: int) -> set[int]:
+        geoms = {g for g, m in view.geometry_owner_model.items() if m == mesh_model_id}
+        skins = {s.skin_id for s in view.skins.values()
+                 if s.geometry_id is not None and s.geometry_id in geoms}
+        return {c for c, s in view.cluster_skin.items() if s in skins}
+
+    moe = registry.get("moe")
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+
+    # A mesh, plus a NON-canonical bone that clusters into it — non-canonical so
+    # the bone rides along (canonical bones are stripped and never renamed).
+    mesh = bone = None
+    for m in (b for b in view.bones.values() if b.type_class == "Mesh"):
+        cids = _clusters_of(m.model_id)
+        if not cids:
+            continue
+        for b in view.limb_bones():
+            if b.name not in display_to_role and set(b.cluster_ids) & cids:
+                mesh, bone = m, b
+                break
+        if mesh is not None:
+            break
+    if mesh is None:
+        pytest.skip("fixture has no mesh skinned by a non-canonical bone")
+
+    bones = []
+    for b in view.limb_bones():
+        role = display_to_role.get(b.name)
+        bones.append(Decision(model_id=b.model_id,
+                              role=role if role else f"Secondary.{b.name}",
+                              verdict="keep"))
+    decisions = DecisionSet(bones=bones, llm_model_id="test-mesh-drop-vs-rename")
+    plan = EditPlan(renames={bone.model_id: f"{bone.name}_RENAMED"})
+
+    kwargs = dict(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="moe",
+        registry=registry, edit_plan=plan, decisions=decisions,
+    )
+    # Before the fix this raised EditError instead of returning.
+    dropped = run_phase_c(drop_mesh_ids={mesh.model_id}, **kwargs)
+    baseline = run_phase_c(**kwargs)
+
+    needle = f'"Model::{mesh.name}"'.encode("ascii")
+    assert dropped.merged_ascii.count(needle) == baseline.merged_ascii.count(needle) - 1, (
+        "the clothing-side copy of the dropped mesh should be gone"
+    )
+    extract(parse(dropped.merged_ascii))
+
+
 def test_phase_c_passthrough_handles_stale_target_drop_ids(
     maya_fbx_ascii: Path, registry,
 ):
@@ -1033,6 +1201,193 @@ def test_phase_c_cross_avatar_applies_target_deform_percent_override(
             break
     else:
         raise AssertionError("DeformPercent missing on target channel after merge")
+
+
+# --- overrides on channels of a dropped mesh ------------------------------------
+
+
+def _mesh_with_channel(view):
+    """A (mesh_model_id, channel) pair where the channel's BlendShape deforms
+    that mesh's geometry — i.e. a mesh drop would cascade into the channel."""
+    from rigforge.ascii_fbx.edits import iter_oo_connections
+    bs_to_geo = {
+        s: d for s, d in iter_oo_connections(view)
+        if s in view.blend_shapes and d in view.geometries
+    }
+    ch = next(c for c in view.blend_shape_channels.values() if c.blend_shape_id in bs_to_geo)
+    return view.geometry_owner_model[bs_to_geo[ch.blend_shape_id]], ch
+
+
+def test_phase_c_override_on_channel_of_dropped_clothing_mesh_is_skipped(
+    maya_fbx_ascii: Path, registry,
+):
+    """FE flow: the modder sets a morph slider, then unchecks that mesh. The
+    mesh drop cascades into the channel node, so the override must be
+    skipped (with a note), not crash with overlapping edits."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    mesh_id, ch = _mesh_with_channel(view)
+    result = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=EditPlan(),
+        drop_mesh_ids={mesh_id},
+        blend_shape_channel_overrides={ch.channel_id: 42.5},
+    )
+    extract(parse(result.merged_ascii))
+    assert b"DeformPercent: 42.5" not in result.merged_ascii
+    assert any("skip: override" in n and "dropped" in n for n in result.notes)
+
+
+def test_phase_c_override_on_channel_of_dropped_target_mesh_is_skipped(
+    maya_fbx_ascii: Path, registry,
+):
+    """Same on the target side: a target mesh drop plus a target override on
+    one of that mesh's channels."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    target_view = registry.get("maya").load_ascii_view()
+    mesh_id, ch = _mesh_with_channel(target_view)
+    result = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=EditPlan(),
+        target_drop_mesh_ids={mesh_id},
+        target_blend_shape_channel_overrides={ch.channel_id: 42.5},
+    )
+    extract(parse(result.merged_ascii))
+    assert b"DeformPercent: 42.5" not in result.merged_ascii
+    assert any("skip: override" in n and "dropped" in n for n in result.notes)
+
+
+# --- bone moves (rest-pose local transform) -----------------------------------
+
+
+def _out_bone(merged_ascii: bytes, name: str):
+    out_view = extract(parse(merged_ascii))
+    matches = [b for b in out_view.bones.values()
+               if b.name == name and b.type_class == "LimbNode"]
+    assert len(matches) == 1, f"expected exactly one {name!r} in output, got {len(matches)}"
+    return out_view, matches[0]
+
+
+def test_phase_c_passthrough_moves_target_bone_by_name(maya_fbx_ascii: Path, registry):
+    """A target-side bone move lands in the merged output: Maya's own hat
+    bone ("Hat Root") gets a new rest position before the splice."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    result = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=EditPlan(),
+        target_bone_transforms=[BoneTransformEdit(
+            bone="Hat Root", transform=LocalTransform(position=(0.0, 0.05, 0.0)), frame="fbx",
+        )],
+    )
+    _, hat = _out_bone(result.merged_ascii, "Hat Root")
+    assert hat.translation_xyz == (0.0, 0.05, 0.0)
+    assert any("bone_transform: moved 1 target" in n for n in result.notes)
+
+
+def test_phase_c_passthrough_clothing_move_on_replaced_bone_is_skipped(
+    maya_fbx_ascii: Path, registry,
+):
+    """donor==target replaces every name-matched clothing bone with the
+    target's copy, so a CLOTHING-side move on such a bone has nothing to land
+    on. It must be skipped with a note (not crash by overlapping the strip),
+    and the output keeps the target's original position."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    hat_before = next(b for b in view.limb_bones() if b.name == "Hat Root").translation_xyz
+    result = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=EditPlan(),
+        bone_transforms=[BoneTransformEdit(
+            bone="Hat Root", transform=LocalTransform(position=(0.0, 0.05, 0.0)), frame="fbx",
+        )],
+    )
+    _, hat = _out_bone(result.merged_ascii, "Hat Root")
+    assert hat.translation_xyz == hat_before
+    assert any(n.startswith("skip: bone_transform") and "Hat Root" in n for n in result.notes)
+    assert not any("bone_transform: moved" in n for n in result.notes)
+
+
+def test_phase_c_cross_avatar_moves_ride_along_clothing_bone_in_unity_frame(
+    maya_fbx_ascii: Path, registry,
+):
+    """The real use case: a clothing-only bone (rides along into the target
+    armature) is moved with Unity-Inspector numbers. Position X is negated
+    and the Y rotation flipped on the way into the FBX."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    moe = registry.get("moe")
+    maya_canon = set(registry.get("maya").canonical_to_name.values())
+    moe_names = {b.name for b in moe.load_ascii_view().bones.values()}
+    sec = next(
+        b for b in view.limb_bones()
+        if b.name not in maya_canon and b.name not in moe_names
+        and any(view.clusters[c].weight_count > 0 for c in b.cluster_ids if c in view.clusters)
+    )
+    display_to_role = {v: k for k, v in moe.canonical_to_name.items()}
+    bones = []
+    for b in view.limb_bones():
+        role = display_to_role.get(b.name)
+        bones.append(Decision(
+            model_id=b.model_id,
+            role=role if role is not None else f"Secondary.{b.name}",
+            verdict="keep",
+        ))
+    decisions = DecisionSet(bones=bones, llm_model_id="t-bone-move")
+    plan = EditPlan.from_decisions(decisions, view, moe)
+
+    result = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="moe",
+        registry=registry, edit_plan=plan, decisions=decisions,
+        bone_transforms=[BoneTransformEdit(
+            bone=sec.model_id,
+            transform=LocalTransform(position=(0.01, 0.02, 0.03), rotation=(0.0, 90.0, 0.0)),
+            frame="unity",
+        )],
+    )
+    out_view, moved = _out_bone(result.merged_ascii, plan.renames.get(sec.model_id, sec.name))
+    assert moved.translation_xyz == pytest.approx((-0.01, 0.02, 0.03))
+    from rigforge.ascii_fbx.sections import model_local_transform
+    t = model_local_transform(out_view, moved.model_id)
+    assert t.rotation == pytest.approx((0.0, -90.0, 0.0), abs=1e-6)
+    assert any("bone_transform: moved 1 clothing" in n for n in result.notes)
+
+
+def test_phase_c_bone_transform_unknown_name_is_noted_not_fatal(
+    maya_fbx_ascii: Path, registry,
+):
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    result = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=EditPlan(),
+        target_bone_transforms=[BoneTransformEdit(
+            bone="NoSuchBone", transform=LocalTransform(scale=(2, 2, 2)),
+        )],
+    )
+    extract(parse(result.merged_ascii))
+    assert any("skip: bone_transform" in n and "NoSuchBone" in n for n in result.notes)
+
+
+def test_phase_c_target_move_on_dropped_target_bone_is_skipped(
+    maya_fbx_ascii: Path, registry,
+):
+    """Drop wins over move on the same target bone — the move would overlap
+    the drop's byte range otherwise."""
+    raw = maya_fbx_ascii.read_bytes()
+    view = extract(parse(raw))
+    hat_id = next(b.model_id for b in view.limb_bones() if b.name == "Hat Root")
+    result = run_phase_c(
+        clothing_ascii=raw, clothing_view=view, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=EditPlan(),
+        target_drop_bone_ids={hat_id},
+        target_bone_transforms=[BoneTransformEdit(
+            bone=hat_id, transform=LocalTransform(position=(0.0, 0.05, 0.0)), frame="fbx",
+        )],
+    )
+    extract(parse(result.merged_ascii))
+    assert any(n.startswith("skip: bone_transform") for n in result.notes)
 
 
 def test_phase_c_cross_avatar_drops_target_blend_shape_channels(
@@ -1257,3 +1612,406 @@ def test_phase_c_cross_avatar_dedup_repoints_connections_to_target(
         f"expected target material {mat_name} to keep id {target_mid}, "
         f"got {merged_mat_ids_by_name[mat_name]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Chained merge: several clothings -> ONE output. "Compose" means merge, not
+# one file per garment (2026-09-20: Marette outfit + a stocking came out as
+# two FBXs; the user wanted both on Maya in one file).
+# ---------------------------------------------------------------------------
+
+
+def _synth_partial(maya_fbx_ascii: Path, tmp_path: Path, *, keep: str, prefix: str,
+                   registry, schema):
+    """A partial synth clothing (one Maya mesh renamed `<prefix><mesh>`, full
+    maya-rigged skeleton) plus its Phase B result — the shape of a real
+    single-garment Booth item that is already rigged for the target."""
+    from training.synth_clothing import build_synth_clothing
+    out_ascii = tmp_path / f"synth_{prefix}.fbx"
+    build = build_synth_clothing(
+        source_ascii=maya_fbx_ascii, out_ascii=out_ascii,
+        out_decisions=tmp_path / f"synth_{prefix}_decisions.json",
+        perturb_targets=(), keep_meshes=(keep,), mesh_rename_prefix=prefix,
+    )
+    raw = out_ascii.read_bytes()
+    view = extract(parse(raw))
+    b = run_phase_b(
+        view=view, donor_id="maya", target_id="maya", registry=registry,
+        schema=schema, llm_client=MockLLMClient(build.decisions, model_id="synth"),
+    )
+    return out_ascii, raw, view, b, build
+
+
+def _object_ids(view) -> list[int]:
+    """Every Objects entry's own id (first numeric arg) — for uniqueness checks."""
+    from rigforge.ascii_fbx.merge import positioned_args
+    src = view.document.source
+    out: list[int] = []
+    for obj in view.document.root("Objects").children:
+        for tok in positioned_args(obj.args_bytes(src)):
+            if tok.kind == "num":
+                out.append(int(tok.value))
+                break
+    return out
+
+
+def _assert_one_shared_skeleton(view, garment_meshes: list[str]) -> None:
+    from collections import Counter
+    meshes = [m.name for m in view.bones.values() if m.type_class == "Mesh"]
+    for g in garment_meshes:
+        assert meshes.count(g) == 1, f"garment {g!r} missing/doubled: {meshes}"
+    assert "Body" in meshes, "target's own Body must survive"
+    limbs = [b.name for b in view.bones.values() if b.type_class == "LimbNode"]
+    assert limbs.count("Hips") == 1, "skeleton must be shared, not doubled"
+    dups = {n: c for n, c in Counter(limbs).items() if c > 1}
+    assert not dups, f"merge doubled bones: {dups}"
+    ids = _object_ids(view)
+    assert len(ids) == len(set(ids)), "colliding object ids after chained merge"
+    # No cluster left dangling: every skin cluster hangs off a bone in the file.
+    attached = {cid for b in view.bones.values() for cid in b.cluster_ids}
+    dangling = set(view.clusters) - attached
+    assert not dangling, f"clusters not attached to any bone: {sorted(dangling)[:5]}"
+
+
+def test_phase_c_chains_second_garment_onto_first_merge(
+    maya_fbx_ascii: Path, registry, schema, tmp_path: Path,
+):
+    """Two garments -> one file. The second merge takes the FIRST merge's
+    output as its target (not the registry's bare avatar), so both garments
+    land on one shared skeleton, the second's ids clear the first's, and the
+    zero-weight sweep runs once at the end (deferred on the intermediate)."""
+    _, raw_a, view_a, b_a, _ = _synth_partial(
+        maya_fbx_ascii, tmp_path, keep="Cloth", prefix="A", registry=registry, schema=schema)
+    _, raw_b, view_b, b_b, _ = _synth_partial(
+        maya_fbx_ascii, tmp_path, keep="Hat", prefix="B", registry=registry, schema=schema)
+
+    first = run_phase_c(
+        clothing_ascii=raw_a, clothing_view=view_a, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=b_a.edit_plan, decisions=b_a.decisions,
+        zero_weight_sweep=False,
+    )
+    assert any("zero_weight_sweep: deferred" in n for n in first.notes)
+    assert not any("zero_weight_sweep: dropped" in n for n in first.notes)
+
+    second = run_phase_c(
+        clothing_ascii=raw_b, clothing_view=view_b, donor_id="maya", target_id="maya",
+        registry=registry, edit_plan=b_b.edit_plan, decisions=b_b.decisions,
+        target_ascii=first.merged_ascii,
+    )
+    merged = extract(parse(second.merged_ascii))
+    _assert_one_shared_skeleton(merged, ["ACloth", "BHat"])
+    meshes = [m.name for m in merged.bones.values() if m.type_class == "Mesh"]
+    assert "Cloth" in meshes and "Hat" in meshes, "target's own outfit survives"
+    assert any("zero_weight_sweep" in n and "deferred" not in n for n in second.notes)
+    # The second offset must clear everything already in the intermediate
+    # (target ids AND the first garment's offset ids).
+    first_view = extract(parse(first.merged_ascii))
+    offset_note = next(n for n in second.notes if n.startswith("offset:"))
+    offset = int(offset_note.rsplit(" ", 1)[1])
+    assert offset > max(_object_ids(first_view))
+
+
+def test_assemble_chains_clothings_into_one_output(
+    maya_fbx_ascii: Path, registry, schema, tmp_path: Path, monkeypatch,
+):
+    """Orchestrator: `clothings=[a, b]` runs Phase A/B per garment and ONE
+    Phase C chain, writes ONE output, announces each garment on the progress
+    callback, and the manifest carries a per-clothing section. Target-side
+    edits apply once (first merge). The converter is stubbed (copy) so this
+    stays fast; test_e2e covers the real binary."""
+    from rigforge.pipeline import orchestrator as orch
+    from rigforge.pipeline.orchestrator import ClothingSpec, assemble
+    from rigforge.manifest import build_manifest
+
+    monkeypatch.setattr(
+        orch, "ascii_to_bin",
+        lambda src, dst: Path(dst).write_bytes(Path(src).read_bytes()),
+    )
+    a_path, _, _, _, build_a = _synth_partial(
+        maya_fbx_ascii, tmp_path, keep="Cloth", prefix="A", registry=registry, schema=schema)
+    b_path, _, _, _, _ = _synth_partial(
+        maya_fbx_ascii, tmp_path, keep="Hat", prefix="B", registry=registry, schema=schema)
+    maya_view = registry.get("maya").load_ascii_view()
+    target_cloth = next(b.model_id for b in maya_view.bones.values()
+                        if b.type_class == "Mesh" and b.name == "Cloth")
+
+    events: list[tuple[str, str]] = []
+    out_fbx = tmp_path / "composed.fbx"
+    run = assemble(
+        clothings=[ClothingSpec(clothing_fbx=a_path), ClothingSpec(clothing_fbx=b_path)],
+        target_id="maya", out_fbx=out_fbx, registry=registry, schema=schema,
+        # Both synth garments keep Maya's unperturbed skeleton (same ids), so
+        # one identity fixture serves both Phase B calls.
+        llm_client=MockLLMClient(build_a.decisions, model_id="synth"),
+        cache=None, work_dir=tmp_path / "work",
+        target_drop_mesh_ids={target_cloth},
+        progress_cb=lambda ph, note: events.append((ph, note)),
+    )
+
+    assert out_fbx.exists()
+    merged = extract(parse(out_fbx.read_bytes()))   # stubbed converter: still ASCII
+    _assert_one_shared_skeleton(merged, ["ACloth", "BHat"])
+    meshes = [m.name for m in merged.bones.values() if m.type_class == "Mesh"]
+    assert "Cloth" not in meshes, "target-side drop must apply (once, first merge)"
+
+    assert [Path(r.clothing_fbx).name for r in run.clothing_runs] == [a_path.name, b_path.name]
+    assert run.donor_id == "maya" and run.target_id == "maya"   # top level = first garment
+    assert [n for ph, n in events if ph == "clothing"] == [a_path.stem, b_path.stem]
+    phases_after_second = [ph for ph, _ in events[events.index(("clothing", b_path.stem)):]]
+    assert "phase_a" in phases_after_second and "phase_c" in phases_after_second
+    # ONE conversion for the whole chain (the write phase emits its two notes once).
+    assert [n for ph, n in events if ph == "write"] == [
+        "converting ASCII → binary FBX", f"wrote {out_fbx.name}",
+    ]
+
+    m = build_manifest(run)
+    assert m["input"]["clothings"] == [str(a_path.resolve()), str(b_path.resolve())]
+    assert [c["stem"] for c in m["clothings"]] == [a_path.stem, b_path.stem]
+    assert all({"donor_id", "edit_plan", "warnings", "notes"} <= set(c) for c in m["clothings"])
+
+
+# kevin's GG.unity (2026-10-15): GG_headset_Maya_3 is a child of Maya's
+# Armature, and its Inspector reads these numbers there.
+GG_UNITY_HEADSET = LocalTransform(position=(0.0, -0.06, 1.08), rotation=(-81.41, 0.0, 0.0))
+
+
+def _maya_armature_id(registry) -> int:
+    view = registry.get("maya").load_ascii_view()
+    (arm,) = [b.model_id for b in view.bones.values() if b.name == "Armature"]
+    return arm
+
+
+def test_assemble_merges_a_rigid_garment_after_a_rigged_one(
+    maya_fbx_ascii: Path, registry, schema, rigid_garment_fbx: Path, tmp_path: Path, monkeypatch,
+):
+    """kevin's GG scene (2026-10-14): outfit + a bone-less headset in ONE
+    compose. The rigid garment skips the donor match and the LLM, hangs its
+    mesh from the target's Armature (in his GG.unity the headset is a child
+    of Maya's Armature), and still takes its blendshape override and its
+    move — read as the Armature-local numbers Unity's Inspector shows there."""
+    from rigforge.ascii_fbx.sections import model_local_transform
+    from rigforge.pipeline import orchestrator as orch
+    from rigforge.pipeline.orchestrator import ClothingSpec, assemble
+
+    monkeypatch.setattr(
+        orch, "ascii_to_bin",
+        lambda src, dst: Path(dst).write_bytes(Path(src).read_bytes()),
+    )
+    a_path, _, _, _, build_a = _synth_partial(
+        maya_fbx_ascii, tmp_path, keep="Cloth", prefix="A", registry=registry, schema=schema)
+    rigid = rigid_garment_fbx
+
+    class CountingLLM(MockLLMClient):
+        calls = 0
+
+        def classify(self, request):
+            CountingLLM.calls += 1
+            return super().classify(request)
+
+    events: list[tuple[str, str]] = []
+    out_fbx = tmp_path / "composed.fbx"
+    run = assemble(
+        clothings=[
+            ClothingSpec(clothing_fbx=a_path),
+            ClothingSpec(
+                clothing_fbx=rigid,
+                blend_shape_channel_overrides={9005: 27.2},
+                bone_transforms=[BoneTransformEdit(bone="Visor", transform=GG_UNITY_HEADSET)],
+            ),
+        ],
+        target_id="maya", out_fbx=out_fbx, registry=registry, schema=schema,
+        llm_client=CountingLLM(build_a.decisions, model_id="synth"),
+        cache=None, work_dir=tmp_path / "work",
+        progress_cb=lambda ph, note: events.append((ph, note)),
+    )
+
+    assert CountingLLM.calls == 1, "the LLM classifies the rigged outfit only"
+    second = run.clothing_runs[1]
+    assert second.phase_a.rigid and second.donor_id == "maya"
+    assert second.edit_plan.is_noop()
+    rigid_notes = [n for ph, n in events[events.index(("clothing", rigid.stem)):] if ph == "phase_b"]
+    assert any("no bones" in n for n in rigid_notes), rigid_notes
+
+    merged = extract(parse(out_fbx.read_bytes()))   # stubbed converter: still ASCII
+    (visor,) = [b for b in merged.bones.values() if b.type_class == "Mesh" and b.name == "Visor"]
+    assert visor.parent_id == _maya_armature_id(registry), "rigid mesh hangs from the Armature"
+    lt = model_local_transform(merged, visor.model_id)
+    assert lt.rotation == pytest.approx((-81.41, 0.0, 0.0), abs=1e-6)
+    assert lt.position == pytest.approx((0.0, -0.06, 1.08), abs=1e-9)
+    (open_ch,) = [c for c in merged.blend_shape_channels.values() if c.name == "Open"]
+    src = merged.document.source
+    (dp,) = [ch for ch in open_ch.node_ref.children if ch.name == "DeformPercent"]
+    assert float(dp.args_bytes(src).strip()) == pytest.approx(27.2)
+    meshes = [m.name for m in merged.bones.values() if m.type_class == "Mesh"]
+    assert "ACloth" in meshes, "the rigged outfit is still there"
+
+
+def _world_matrix(view, model_id: int):
+    """Rest-pose world matrix of a Model: its Lcl T.R.S composed up the parent
+    chain (no pivots / pre-rotation — the curated avatars use none)."""
+    from rigforge.ascii_fbx.sections import _local_matrix, _mat_mul, model_local_transform
+    m = None
+    mid = model_id
+    while mid is not None and mid in view.bones:
+        lt = model_local_transform(view, mid)
+        local = _local_matrix(lt.position, lt.rotation, lt.scale)
+        m = local if m is None else _mat_mul(local, m)
+        mid = view.bones[mid].parent_id
+    return m
+
+
+class _NoLLM:
+    """A rigid garment must never reach the LLM."""
+    model_id = "none"
+
+    def classify(self, request):
+        raise AssertionError("LLM called for a garment that needs none")
+
+
+def _assemble_rigid(tmp_path, monkeypatch, registry, schema, clothings):
+    from rigforge.pipeline import orchestrator as orch
+    from rigforge.pipeline.orchestrator import assemble
+    monkeypatch.setattr(
+        orch, "ascii_to_bin",
+        lambda src, dst: Path(dst).write_bytes(Path(src).read_bytes()),
+    )
+    out_fbx = tmp_path / "composed.fbx"
+    run = assemble(
+        clothings=clothings, target_id="maya", out_fbx=out_fbx, registry=registry,
+        schema=schema, llm_client=_NoLLM(), cache=None, work_dir=tmp_path / "work",
+    )
+    return run, extract(parse(out_fbx.read_bytes()))   # stubbed converter: still ASCII
+
+
+def test_attach_hangs_a_rigid_garment_on_a_target_bone_where_it_stood(
+    maya_fbx_ascii: Path, registry, schema, rigid_garment_fbx: Path, tmp_path: Path, monkeypatch,
+):
+    """kevin's GG headset (2026-10-14) must FOLLOW her: a rigid garment can be
+    attached to a target bone. Like dragging it onto that bone in Unity's
+    Hierarchy, it keeps its world placement — the move reads in the
+    Armature frame (his GG.unity numbers) — and only its parent changes."""
+    from rigforge.ascii_fbx.sections import _local_matrix, _mat_mul
+    from rigforge.ascii_fbx.transform import unity_to_fbx
+    from rigforge.pipeline.orchestrator import ClothingSpec
+
+    maya_view = registry.get("maya").load_ascii_view()
+    (neck,) = [b.model_id for b in maya_view.bones.values() if b.name == "Neck"]
+    run, merged = _assemble_rigid(tmp_path, monkeypatch, registry, schema, [ClothingSpec(
+        clothing_fbx=rigid_garment_fbx,
+        bone_transforms=[BoneTransformEdit(bone="Visor", transform=GG_UNITY_HEADSET)],
+        attach_to_bone_id=neck,
+    )])
+
+    (visor,) = [b for b in merged.bones.values() if b.type_class == "Mesh" and b.name == "Visor"]
+    assert visor.parent_id == neck
+    f = unity_to_fbx(GG_UNITY_HEADSET)
+    want = _mat_mul(
+        _world_matrix(merged, _maya_armature_id(registry)),
+        _local_matrix(f.position, f.rotation, (1.0, 1.0, 1.0)),
+    )
+    got = _world_matrix(merged, visor.model_id)
+    assert all(abs(got[i][j] - want[i][j]) < 1e-6 for i in range(4) for j in range(4)), got
+    assert any(n.startswith("attach:") and "Neck" in n for n in run.notes), run.notes
+
+
+def test_gg_unity_numbers_put_the_headset_at_her_neck(
+    registry, schema, rigid_garment_fbx: Path, tmp_path: Path, monkeypatch,
+):
+    """The 2026-10-15 21:56 run read kevin's Armature-local numbers in the
+    scene-root (Y-up) frame: the headset sat at world (0, -0.085, 1.07), under
+    the floor and 1 m in front of her. Read in the Armature frame they land
+    at her neck: world (0, 1.08, 0.06), a few cm from her Neck joint."""
+    import math
+
+    from rigforge.pipeline.orchestrator import ClothingSpec
+
+    maya_view = registry.get("maya").load_ascii_view()
+    (neck,) = [b.model_id for b in maya_view.bones.values() if b.name == "Neck"]
+    _run, merged = _assemble_rigid(tmp_path, monkeypatch, registry, schema, [ClothingSpec(
+        clothing_fbx=rigid_garment_fbx,
+        bone_transforms=[BoneTransformEdit(bone="Visor", transform=GG_UNITY_HEADSET)],
+        attach_to_bone_id=neck,
+    )])
+    (visor,) = [b for b in merged.bones.values() if b.type_class == "Mesh" and b.name == "Visor"]
+    w = _world_matrix(merged, visor.model_id)
+    pos = (w[0][3], w[1][3], w[2][3])
+    assert pos == pytest.approx((0.0, 1.08, 0.06), abs=1e-6)
+    n = _world_matrix(merged, neck)
+    assert math.dist(pos, (n[0][3], n[1][3], n[2][3])) < 0.05
+
+
+def test_rigid_garment_without_attach_hangs_from_the_armature_where_it_stood(
+    registry, schema, rigid_garment_fbx: Path, tmp_path: Path, monkeypatch,
+):
+    """No attach bone, no move: the mesh moves under the target's Armature (as
+    in kevin's GG.unity) and keeps its file placement in the world."""
+    from rigforge.ascii_fbx.sections import _local_matrix
+    from rigforge.pipeline.orchestrator import ClothingSpec
+
+    _run, merged = _assemble_rigid(tmp_path, monkeypatch, registry, schema, [ClothingSpec(
+        clothing_fbx=rigid_garment_fbx,
+    )])
+    (visor,) = [b for b in merged.bones.values() if b.type_class == "Mesh" and b.name == "Visor"]
+    assert visor.parent_id == _maya_armature_id(registry)
+    want = _local_matrix((0.0, 0.0, 0.0), (-90.0, 0.0, 0.0), (1.0, 1.0, 1.0))   # its own file values
+    got = _world_matrix(merged, visor.model_id)
+    assert all(abs(got[i][j] - want[i][j]) < 1e-6 for i in range(4) for j in range(4)), got
+
+
+def test_rigid_position_only_move_keeps_the_file_rotation(
+    registry, schema, rigid_garment_fbx: Path, tmp_path: Path, monkeypatch,
+):
+    """A move that sets only the position keeps the file's rotation — taken in
+    the Armature frame, so the mesh's world rotation is unchanged."""
+    from rigforge.ascii_fbx.sections import _local_matrix, _mat_mul
+    from rigforge.pipeline.orchestrator import ClothingSpec
+
+    _run, merged = _assemble_rigid(tmp_path, monkeypatch, registry, schema, [ClothingSpec(
+        clothing_fbx=rigid_garment_fbx,
+        bone_transforms=[BoneTransformEdit(
+            bone="Visor", transform=LocalTransform(position=(0.0, -0.06, 1.08)),
+        )],
+    )])
+    (visor,) = [b for b in merged.bones.values() if b.type_class == "Mesh" and b.name == "Visor"]
+    arm = _world_matrix(merged, _maya_armature_id(registry))
+    want = _mat_mul(arm, _local_matrix((0.0, -0.06, 1.08), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
+    got = _world_matrix(merged, visor.model_id)
+    assert all(abs(got[i][j] - want[i][j]) < 1e-6 for i in range(4) for j in range(4)), got
+
+
+def test_attach_without_a_move_keeps_the_file_placement(
+    registry, schema, rigid_garment_fbx: Path, tmp_path: Path, monkeypatch,
+):
+    from rigforge.ascii_fbx.sections import _local_matrix
+    from rigforge.pipeline.orchestrator import ClothingSpec
+
+    maya_view = registry.get("maya").load_ascii_view()
+    (head,) = [b.model_id for b in maya_view.bones.values() if b.name == "Head"]
+    _run, merged = _assemble_rigid(tmp_path, monkeypatch, registry, schema, [ClothingSpec(
+        clothing_fbx=rigid_garment_fbx, attach_to_bone_id=head,
+    )])
+    (visor,) = [b for b in merged.bones.values() if b.type_class == "Mesh" and b.name == "Visor"]
+    assert visor.parent_id == head
+    want = _local_matrix((0.0, 0.0, 0.0), (-90.0, 0.0, 0.0), (1.0, 1.0, 1.0))   # its own file values
+    got = _world_matrix(merged, visor.model_id)
+    assert all(abs(got[i][j] - want[i][j]) < 1e-6 for i in range(4) for j in range(4)), got
+
+
+def test_attach_is_only_for_a_rigid_garment(
+    maya_fbx_ascii: Path, registry, schema, tmp_path: Path, monkeypatch,
+):
+    from rigforge.pipeline.orchestrator import ClothingSpec, PipelineError
+    with pytest.raises(PipelineError, match="no bones"):
+        _assemble_rigid(tmp_path, monkeypatch, registry, schema, [ClothingSpec(
+            clothing_fbx=maya_fbx_ascii, attach_to_bone_id=1,
+        )])
+
+
+def test_attach_to_a_bone_the_target_lacks_fails(
+    registry, schema, rigid_garment_fbx: Path, tmp_path: Path, monkeypatch,
+):
+    from rigforge.pipeline.orchestrator import ClothingSpec
+    with pytest.raises(PhaseCError, match="not a bone"):
+        _assemble_rigid(tmp_path, monkeypatch, registry, schema, [ClothingSpec(
+            clothing_fbx=rigid_garment_fbx, attach_to_bone_id=1,
+        )])

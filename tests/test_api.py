@@ -56,6 +56,63 @@ def client(stress_dir: Path) -> TestClient:
     return TestClient(app)
 
 
+def _fake_cut_report(mesh="Heel", unweighted_after=0):
+    return {
+        "op": "bisect_cut",
+        "edit": {
+            "mesh": mesh,
+            "verts_before": 11008,
+            "verts_after": 10488,
+            "verts_removed": 520,
+            "unweighted_verts_before": 0,
+            "unweighted_verts_after": unweighted_after,
+        },
+        "previews": {},
+    }
+
+
+def test_taste_edit_clean_cut(client: TestClient, tmp_path: Path, monkeypatch):
+    """Endpoint runs bisect_cut (mocked — no Blender) and returns the edited
+    path + integrity flag + preview slots."""
+    import rigforge.geometry.blender_edit as be
+    clothing = tmp_path / "c.fbx"; clothing.write_bytes(b"x")
+    monkeypatch.setattr(be, "bisect_cut", lambda src, out, **kw: _fake_cut_report(kw["mesh"]))
+
+    r = client.post("/api/clothings/taste-edit",
+                    json={"clothing_path": str(clothing), "mesh": "Heel", "cut_pct": 0.15})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mesh"] == "Heel"
+    assert body["verts_removed"] == 520
+    assert body["weights_ok"] is True
+    assert "preview_before" in body and "preview_after" in body  # None w/o render
+    assert body["edited_path"].endswith("__Heel_cut.fbx")
+
+
+def test_taste_edit_unweighted_fails_integrity(client: TestClient, tmp_path: Path, monkeypatch):
+    import rigforge.geometry.blender_edit as be
+    clothing = tmp_path / "c.fbx"; clothing.write_bytes(b"x")
+    monkeypatch.setattr(be, "bisect_cut",
+                        lambda src, out, **kw: _fake_cut_report(unweighted_after=4))
+    r = client.post("/api/clothings/taste-edit",
+                    json={"clothing_path": str(clothing), "mesh": "Heel"})
+    assert r.status_code == 200
+    assert r.json()["weights_ok"] is False
+
+
+def test_taste_edit_missing_file_404(client: TestClient):
+    r = client.post("/api/clothings/taste-edit",
+                    json={"clothing_path": "/no/such/file.fbx", "mesh": "Heel"})
+    assert r.status_code == 404
+
+
+def test_taste_edit_unsupported_op_400(client: TestClient, tmp_path: Path):
+    clothing = tmp_path / "c.fbx"; clothing.write_bytes(b"x")
+    r = client.post("/api/clothings/taste-edit",
+                    json={"clothing_path": str(clothing), "mesh": "Heel", "op": "scale_slice"})
+    assert r.status_code == 400
+
+
 def test_list_assemblies_empty(client: TestClient):
     r = client.get("/api/assemblies")
     assert r.status_code == 200
@@ -193,6 +250,56 @@ def test_inspect_returns_bone_tree(client: TestClient, maya_fbx_ascii: Path):
         assert key in sample, f"bone record missing {key!r}"
     # Hips appears among the bones — it's the canonical root.
     assert any(b["name"] == "Hips" for b in body["bones"])
+    assert body["rigid"] is False
+
+
+def test_inspect_flags_a_garment_with_no_bones_as_rigid(client: TestClient, rigid_garment_fbx: Path):
+    """The FE offers 'attach to bone' only for a rigid garment (no bones,
+    e.g. GG_headset); the BE decides which those are."""
+    r = client.post("/api/clothings/inspect", json={"path": str(rigid_garment_fbx)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rigid"] is True
+    assert [b["name"] for b in body["bones"] if b["type_class"] == "Mesh"] == ["Visor"]
+
+
+def test_inspect_gives_a_rigid_mesh_its_placement_in_the_target_armature_frame(
+    client: TestClient, rigid_garment_fbx: Path,
+):
+    """A rigid garment's move reads in the target's Armature frame (kevin's
+    GG.unity: the headset under Maya's Armature), so the Move panel must open
+    on the file's placement in THAT frame. The visor's file rotation (-90 X)
+    is the Armature's own, so there it reads ~0."""
+    r = client.post(
+        "/api/clothings/inspect",
+        json={"path": str(rigid_garment_fbx), "target_id": "maya"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rigid_frame"] == "Armature"
+    (visor,) = [b for b in body["bones"] if b["name"] == "Visor"]
+    lt = visor["local_transform_unity"]
+    assert lt["position"] == pytest.approx([0.0, 0.0, 0.0], abs=1e-6)
+    assert lt["rotation"] == pytest.approx([0.0, 0.0, 0.0], abs=1e-4)
+    assert lt["scale"] == pytest.approx([1.0, 1.0, 1.0], abs=1e-9)
+
+
+def test_inspect_without_a_target_keeps_a_rigid_mesh_file_values(
+    client: TestClient, rigid_garment_fbx: Path,
+):
+    r = client.post("/api/clothings/inspect", json={"path": str(rigid_garment_fbx)})
+    body = r.json()
+    assert body["rigid_frame"] is None
+    (visor,) = [b for b in body["bones"] if b["name"] == "Visor"]
+    assert visor["local_transform_unity"]["rotation"] == pytest.approx([-90.0, 0.0, 0.0], abs=1e-6)
+
+
+def test_inspect_with_an_unknown_target_is_400(client: TestClient, rigid_garment_fbx: Path):
+    r = client.post(
+        "/api/clothings/inspect",
+        json={"path": str(rigid_garment_fbx), "target_id": "no-such-avatar"},
+    )
+    assert r.status_code == 400
 
 
 def test_inspect_rejects_missing_path(client: TestClient, tmp_path: Path):
@@ -245,6 +352,8 @@ def assemble_client(stress_dir: Path, tmp_path: Path):
             warnings: list = []
             phase_b = _PhaseBStub()
             notes: list[str] = ["stub run"]
+            bone_transforms: list = []
+            target_bone_transforms: list = []
         return _Run()
 
     output_dir = tmp_path / "out"
@@ -449,6 +558,118 @@ def test_assemble_endpoint_omits_channel_overrides_when_empty(
     assert captured.get("target_blend_shape_channel_overrides") in (None, {})
 
 
+# --- bone moves ----------------------------------------------------------------
+
+
+def test_assemble_endpoint_forwards_bone_transforms(assemble_client, maya_fbx_ascii: Path):
+    """The FE sends one entry per moved bone with the Unity-Inspector numbers
+    it showed the modder. The endpoint hands the orchestrator
+    BoneTransformEdit objects (frame preserved; conversion happens in Phase C)."""
+    from rigforge.ascii_fbx.transform import LocalTransform
+    from rigforge.pipeline.bone_transforms import BoneTransformEdit
+
+    client, captured, _ = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+        "bone_transforms": [
+            {"bone_id": 42, "position": [0, 0.05, 0]},
+            {"bone_id": 43, "rotation": [0, 0, 10], "scale": [1, 1, 1.5], "frame": "fbx"},
+        ],
+        "target_bone_transforms": [
+            {"bone_id": 7, "position": [1, 2, 3], "frame": "unity"},
+        ],
+    })
+    assert r.status_code == 200, r.text
+    assert captured["bone_transforms"] == [
+        BoneTransformEdit(bone=42, transform=LocalTransform(position=(0.0, 0.05, 0.0)), frame="unity"),
+        BoneTransformEdit(
+            bone=43,
+            transform=LocalTransform(rotation=(0.0, 0.0, 10.0), scale=(1.0, 1.0, 1.5)),
+            frame="fbx",
+        ),
+    ]
+    assert captured["target_bone_transforms"] == [
+        BoneTransformEdit(bone=7, transform=LocalTransform(position=(1.0, 2.0, 3.0)), frame="unity"),
+    ]
+
+
+def test_assemble_endpoint_omits_bone_transforms_when_empty(
+    assemble_client, maya_fbx_ascii: Path,
+):
+    client, captured, _ = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+    })
+    assert r.status_code == 200
+    assert captured.get("bone_transforms") in (None, [])
+    assert captured.get("target_bone_transforms") in (None, [])
+
+
+@pytest.mark.parametrize("bad", [
+    {"bone_id": 1, "position": [0, 1]},              # wrong arity
+    {"bone_id": 1, "position": [0, 1, 2], "frame": "blender"},
+    {"bone_id": 1},                                   # nothing to set
+    {"position": [0, 1, 2]},                          # no bone
+])
+def test_assemble_endpoint_rejects_malformed_bone_transform(
+    assemble_client, maya_fbx_ascii: Path, bad,
+):
+    client, captured, _ = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+        "bone_transforms": [bad],
+    })
+    assert r.status_code == 422, r.text
+    assert "bone_transforms" not in captured
+
+
+def test_manifest_records_bone_transforms(assemble_client, maya_fbx_ascii: Path):
+    """The manifest must carry the moves (the FE's other selections live only
+    in browser storage — this one is written down)."""
+    client, captured, output_dir = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothing_path": str(maya_fbx_ascii),
+        "bone_transforms": [{"bone_id": 42, "position": [0, 0.05, 0]}],
+    })
+    assert r.status_code == 200, r.text
+    # The stub run doesn't echo inputs; the manifest builder reads them off
+    # the run object — so patch the stub's list to what the endpoint parsed.
+    # (Real PipelineRun objects carry them; see test_cli_manifest.)
+    assert "bone_transforms" in r.json()["manifest"]["input"]
+
+
+def test_inspect_returns_local_transform_in_unity_frame(
+    client: TestClient, maya_fbx_ascii: Path,
+):
+    """Every bone record carries `local_transform_unity` — the parent-local
+    position / rotation / scale as Unity's Inspector will show them — so the
+    FE can prefill the move panel with the file's current values."""
+    from rigforge.ascii_fbx.lexer import parse
+    from rigforge.ascii_fbx.sections import extract, model_local_transform
+    from rigforge.ascii_fbx.transform import fbx_to_unity
+
+    r = client.post("/api/clothings/inspect", json={"path": str(maya_fbx_ascii)})
+    assert r.status_code == 200
+    bones = r.json()["bones"]
+    for b in bones:
+        lt = b["local_transform_unity"]
+        assert set(lt) == {"position", "rotation", "scale"}
+        assert all(len(lt[k]) == 3 for k in lt)
+
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    wrist = next(b for b in bones if b["name"] == "Left wrist")
+    expected = fbx_to_unity(model_local_transform(view, wrist["model_id"]))
+    assert wrist["local_transform_unity"]["position"] == pytest.approx(expected.position)
+    assert wrist["local_transform_unity"]["rotation"] == pytest.approx(expected.rotation)
+    assert wrist["local_transform_unity"]["scale"] == pytest.approx(expected.scale)
+    # Sanity on the mirroring: the FBX puts the left arm on +X, Unity on -X.
+    assert wrist["local_transform_unity"]["position"][0] < 0
+
+
 # --- streaming assemble -----------------------------------------------------
 
 
@@ -498,6 +719,8 @@ def assemble_stream_client(stress_dir: Path, tmp_path: Path):
             warnings: list = []
             phase_b = _PhaseBStub()
             notes: list[str] = ["stub run"]
+            bone_transforms: list = []
+            target_bone_transforms: list = []
         return _Run()
 
     output_dir = tmp_path / "out"
@@ -660,3 +883,114 @@ def test_inspect_subtree_size_matches_descendant_count(
     # Spot-check 5 bones
     for b in body["bones"][:5]:
         assert b["subtree_size"] == descendants(b["model_id"])
+
+
+# ---------------------------------------------------------------------------
+# Multi-clothing compose: ONE request carrying every garment -> ONE run
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_endpoint_chains_multiple_clothings_into_one_run(
+    assemble_client, maya_fbx_ascii: Path, tmp_path: Path,
+):
+    client, captured, output_dir = assemble_client
+    second = tmp_path / "second_garment.fbx"
+    second.write_bytes(b"stub")   # existence only; the fake never reads it
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothings": [
+            {"clothing_path": str(maya_fbx_ascii), "drop_mesh_ids": [10]},
+            {"clothing_path": str(second), "drop_blend_shape_channel_ids": [901],
+             "blend_shape_channel_overrides": [{"channel_id": 902, "deform_percent": 30}]},
+        ],
+        "target_drop_mesh_ids": [200],
+    })
+    assert r.status_code == 200, r.text
+    specs = captured["clothings"]
+    assert [str(s.clothing_fbx) for s in specs] == [str(maya_fbx_ascii), str(second)]
+    assert specs[0].drop_mesh_ids == {10}
+    assert specs[0].drop_blend_shape_channel_ids is None
+    assert specs[1].drop_blend_shape_channel_ids == {901}
+    assert specs[1].blend_shape_channel_overrides == {902: 30.0}
+    assert "clothing_fbx" not in captured, "multi form must not also send the single path"
+    assert captured["target_drop_mesh_ids"] == {200}
+    body = r.json()
+    stem = f"{maya_fbx_ascii.stem}+second_garment"
+    assert body["id"] == stem
+    assert Path(body["output_fbx"]).name == f"{stem}__maya.fbx"
+
+
+def test_assemble_endpoint_forwards_attach_to_bone_id(
+    assemble_client, maya_fbx_ascii: Path, rigid_garment_fbx: Path,
+):
+    client, captured, _out = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothings": [
+            {"clothing_path": str(maya_fbx_ascii)},
+            {"clothing_path": str(rigid_garment_fbx), "attach_to_bone_id": 2226590603152},
+        ],
+    })
+    assert r.status_code == 200, r.text
+    specs = captured["clothings"]
+    assert specs[0].attach_to_bone_id is None
+    assert specs[1].attach_to_bone_id == 2226590603152
+
+
+def test_assemble_endpoint_multi_clothing_missing_file_is_404(
+    assemble_client, maya_fbx_ascii: Path,
+):
+    client, _captured, _out = assemble_client
+    r = client.post("/api/assemble", json={
+        "target_id": "maya",
+        "clothings": [
+            {"clothing_path": str(maya_fbx_ascii)},
+            {"clothing_path": "C:/nope/missing_garment.fbx"},
+        ],
+    })
+    assert r.status_code == 404
+    assert "missing_garment.fbx" in r.json()["detail"]
+
+
+def test_assemble_endpoint_requires_at_least_one_clothing(assemble_client):
+    client, _captured, _out = assemble_client
+    r = client.post("/api/assemble", json={"target_id": "maya", "clothings": []})
+    assert r.status_code == 422
+
+
+def test_assemble_stream_tags_events_with_clothing_index(
+    assemble_stream_client, maya_fbx_ascii: Path, tmp_path: Path,
+):
+    """The orchestrator announces each garment with a 'clothing' progress
+    event; the endpoint turns that into {"event":"clothing","index":i,...}
+    and stamps every later progress event with clothing_index so the FE can
+    drive one progress row per garment from a single stream."""
+    client, _captured, _out, scripted = assemble_stream_client
+    second = tmp_path / "second_garment.fbx"
+    second.write_bytes(b"stub")
+    scripted[:] = [
+        ("clothing", maya_fbx_ascii.stem),
+        ("phase_a", "donor=maya score=1.00"),
+        ("clothing", "second_garment"),
+        ("phase_a", "donor=maya score=1.00"),
+        ("phase_c", "merge complete"),
+        ("write", "wrote stub.fbx"),
+    ]
+    with client.stream("POST", "/api/assemble/stream", json={
+        "target_id": "maya",
+        "clothings": [
+            {"clothing_path": str(maya_fbx_ascii)},
+            {"clothing_path": str(second)},
+        ],
+    }) as response:
+        assert response.status_code == 200
+        events = _read_ndjson_events(response)
+
+    clothing_events = [e for e in events if e["event"] == "clothing"]
+    assert [e["index"] for e in clothing_events] == [0, 1]
+    assert [e["stem"] for e in clothing_events] == [maya_fbx_ascii.stem, "second_garment"]
+    assert clothing_events[1]["path"] == str(second)
+    progress = [e for e in events if e["event"] == "progress"]
+    assert [e["clothing_index"] for e in progress] == [0, 1, 1, 1]
+    assert events[-1]["event"] == "done"
+    assert events[-1]["id"] == f"{maya_fbx_ascii.stem}+second_garment"

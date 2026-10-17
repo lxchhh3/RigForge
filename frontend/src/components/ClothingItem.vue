@@ -4,6 +4,8 @@ import type { ComposedClothing } from '../stores/compose'
 import { useComposeStore } from '../stores/compose'
 import MeshList from './MeshList.vue'
 import BlendShapeList from './BlendShapeList.vue'
+import GeometryEditPanel from './GeometryEditPanel.vue'
+import BoneTransformPanel from './BoneTransformPanel.vue'
 
 const props = defineProps<{ clothing: ComposedClothing }>()
 const compose = useComposeStore()
@@ -16,6 +18,23 @@ const meshCount = computed(() =>
 const channelCount = computed(() =>
   props.clothing.inspect?.blend_shape_channels?.length ?? 0,
 )
+
+// A rigid garment (no bones) can hang from one of the TARGET's bones so it
+// follows her; by default it hangs from the target's Armature (as in Unity),
+// which follows no bone.
+const targetBones = computed(() =>
+  (compose.target.inspect?.bones ?? [])
+    .filter((b) => b.type_class === 'LimbNode')
+    .sort((a, b) => a.name.localeCompare(b.name)),
+)
+// <select> values are strings in the DOM: '' = the default parent (null in the store).
+const defaultParent = computed(() => props.clothing.inspect?.rigid_frame ?? 'avatar root')
+const attachValue = computed<string>({
+  get: () => (props.clothing.attachBoneId === null ? '' : String(props.clothing.attachBoneId)),
+  set: (v) => {
+    props.clothing.attachBoneId = v === '' ? null : Number(v)
+  },
+})
 
 function remove() {
   compose.removeClothing(props.clothing.path)
@@ -35,11 +54,29 @@ function remove() {
     </div>
     <template v-else-if="clothing.inspect">
       <div class="meta">
-        donor: <strong>{{ clothing.inspect.donor_id ?? 'unknown' }}</strong>
-        <span v-if="clothing.inspect.donor_id">
-          (score {{ clothing.inspect.donor_score.toFixed(2) }})
-        </span>
+        <template v-if="clothing.inspect.rigid">
+          <strong data-testid="rigid-badge">rigid garment (no bones)</strong>
+        </template>
+        <template v-else>
+          donor: <strong>{{ clothing.inspect.donor_id ?? 'unknown' }}</strong>
+          <span v-if="clothing.inspect.donor_id">
+            (score {{ clothing.inspect.donor_score.toFixed(2) }})
+          </span>
+        </template>
         — {{ meshCount }} meshes, {{ channelCount }} blendshapes
+      </div>
+      <div v-if="clothing.inspect.rigid" class="attach">
+        <label>
+          attach to bone
+          <select v-model="attachValue" data-testid="attach-bone" class="attach-select">
+            <option value="">{{ defaultParent }} (follows no bone)</option>
+            <option v-for="b in targetBones" :key="b.model_id" :value="String(b.model_id)">{{ b.name }}</option>
+          </select>
+        </label>
+        <p class="hint">
+          Hangs from this bone of the target so it follows her; it stays where it
+          is placed (same as dragging it onto the bone in Unity's Hierarchy).
+        </p>
       </div>
       <div class="tree-wrap">
         <MeshList :source="clothing" armature-label="Armature" />
@@ -47,6 +84,8 @@ function remove() {
       <div v-if="channelCount > 0" class="bs-wrap">
         <BlendShapeList :source="clothing" heading="Blendshapes" />
       </div>
+      <GeometryEditPanel v-if="meshCount > 0" :clothing="clothing" />
+      <BoneTransformPanel :source="clothing" />
     </template>
   </section>
 </template>
@@ -103,6 +142,23 @@ function remove() {
 .meta strong {
   color: #ddd;
   font-weight: 600;
+}
+.attach {
+  padding: 0.25rem 0 0.5rem 0;
+  font-size: 0.85rem;
+  color: #bbb;
+}
+.attach-select {
+  margin-left: 0.5rem;
+  background: #1a1a1a;
+  color: #ddd;
+  border: 1px solid #444;
+  padding: 0.15rem 0.35rem;
+}
+.attach .hint {
+  margin: 0.25rem 0 0 0;
+  color: #777;
+  font-size: 0.75rem;
 }
 .tree-wrap {
   max-height: 400px;

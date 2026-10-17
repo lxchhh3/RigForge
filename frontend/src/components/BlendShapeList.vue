@@ -47,9 +47,22 @@ function hasOverride(c: InspectedChannel): boolean {
   return props.source.channelOverrides.has(c.channel_id)
 }
 
-function onSlide(c: InspectedChannel, e: Event) {
-  const raw = (e.target as HTMLInputElement).valueAsNumber
-  const value = Math.max(0, Math.min(100, raw))
+// Two decimals is the precision the modder asked for (2026-09-08): the slider
+// alone was integer-only. Both the slider and the typed field go through
+// this, so a value is always 0..100 with at most two decimals.
+function normalize(raw: number): number {
+  const clamped = Math.max(0, Math.min(100, raw))
+  return Math.round(clamped * 100) / 100
+}
+
+// "75" not "75.00", "12.34" not "12.340000001": what the file will carry.
+function display(v: number): string {
+  return String(normalize(v))
+}
+
+function apply(c: InspectedChannel, raw: number) {
+  if (!Number.isFinite(raw)) return // empty / half-typed field ("12.")
+  const value = normalize(raw)
   if (value === c.deform_percent) {
     // Snapping back to the on-disk value clears the override entirely — keeps
     // the assemble payload free of no-op entries.
@@ -57,6 +70,22 @@ function onSlide(c: InspectedChannel, e: Event) {
   } else {
     compose.setChannelOverride(props.source, c.channel_id, value)
   }
+}
+
+function onSlide(c: InspectedChannel, e: Event) {
+  apply(c, (e.target as HTMLInputElement).valueAsNumber)
+}
+
+function onType(c: InspectedChannel, e: Event) {
+  apply(c, (e.target as HTMLInputElement).valueAsNumber)
+}
+
+// On blur/Enter, rewrite the field with the normalized value so "12.346" or
+// "250" does not linger in the box after it was rounded/clamped.
+function onTypeCommit(c: InspectedChannel, e: Event) {
+  const el = e.target as HTMLInputElement
+  apply(c, el.valueAsNumber)
+  el.value = display(valueFor(c))
 }
 </script>
 
@@ -85,15 +114,26 @@ function onSlide(c: InspectedChannel, e: Event) {
         <span class="name">{{ c.name }}</span>
         <span v-if="c.owner_name" class="meta">{{ c.owner_name }}</span>
         <input
-          type="range" min="0" max="100" step="1"
+          type="range" min="0" max="100" step="0.01"
           :disabled="isDropped(c.channel_id)"
           :value="valueFor(c)"
           @input="onSlide(c, $event)"
           class="slider"
           data-testid="blendshape-slider"
         />
+        <input
+          type="number" min="0" max="100" step="0.01"
+          :disabled="isDropped(c.channel_id)"
+          :value="display(valueFor(c))"
+          @input="onType(c, $event)"
+          @change="onTypeCommit(c, $event)"
+          class="number"
+          :class="{ overridden: hasOverride(c) }"
+          title="Type a value (0–100, two decimals)"
+          data-testid="blendshape-number"
+        />
         <span class="value" :class="{ overridden: hasOverride(c) }"
-              data-testid="blendshape-value">{{ valueFor(c) }}</span>
+              data-testid="blendshape-value">{{ display(valueFor(c)) }}</span>
       </li>
       <li v-if="channels.length === 0" class="empty">
         <template v-if="filter">No matches for "{{ filter }}".</template>
@@ -168,6 +208,24 @@ function onSlide(c: InspectedChannel, e: Event) {
 }
 .bs-row .slider:disabled {
   opacity: 0.3;
+}
+.bs-row .number {
+  width: 4.2rem;
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  color: #ddd;
+  padding: 0.1rem 0.3rem;
+  font-family: inherit;
+  font-size: 0.75rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.bs-row .number:disabled {
+  opacity: 0.3;
+}
+.bs-row .number.overridden {
+  color: #cd8;
+  border-color: #564;
 }
 .bs-row .value {
   color: #888;

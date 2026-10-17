@@ -22,7 +22,7 @@ function phaseIndex(p: AssembleProgress): number {
 
 function fillPercent(p: AssembleProgress): number {
   if (p.status === 'succeeded') return 100
-  if (p.status === 'failed') return 0
+  if (p.status === 'failed' || p.status === 'queued') return 0
   const idx = phaseIndex(p)
   if (idx < 0) return 4 // small visible sliver while we wait for the first event
   // 4 phases → 25% per phase. We render the bar at the start of each phase
@@ -45,7 +45,7 @@ const items = computed(() => progress.value)
            data-testid="assemble-progress">
     <h2>Progress</h2>
     <ul>
-      <li v-for="p in items" :key="p.clothingPath"
+      <li v-for="(p, i) in items" :key="i"
           class="progress-row" :data-status="p.status"
           :data-phase="p.phase ?? 'pending'"
           data-testid="assemble-progress-row">
@@ -56,6 +56,7 @@ const items = computed(() => progress.value)
               {{ p.phase ? PHASE_LABELS[p.phase] : 'starting' }}…
             </template>
             <template v-else-if="p.status === 'succeeded'">done</template>
+            <template v-else-if="p.status === 'queued'">queued</template>
             <template v-else>failed</template>
           </span>
         </div>

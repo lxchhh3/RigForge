@@ -88,6 +88,16 @@ def test_system_message_includes_required_roles(schema):
         assert r in sys, f"required role {r} missing from system prompt"
 
 
+def test_system_message_tells_llm_partial_garments_may_omit_required_roles(schema):
+    """A legs-only garment has no Head bone. The prompt must say a partial
+    garment may leave required roles unassigned, or a re-prompt pressures
+    the LLM into forcing a required role onto the wrong bone."""
+    msgs = build_messages(request=_make_request(), schema=schema)
+    sys = msgs[0]["content"]
+    assert "PARTIAL garment" in sys
+    assert "NEVER force a required role" in sys
+
+
 def test_system_message_explains_drop_categories(schema):
     msgs = build_messages(request=_make_request(), schema=schema)
     sys = msgs[0]["content"]

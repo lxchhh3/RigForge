@@ -106,6 +106,42 @@ const DEFAULT_ASSEMBLE_STREAM = [
   { event: 'done', id: 'fake', output_fbx: '/tmp/fake.fbx', manifest: {} },
 ]
 
+// Wire shape of the assemble request: ONE request carries EVERY clothing.
+// Per-clothing selections ride inside `clothings[i]`; target-side ones stay
+// top-level.
+type ClothingWire = {
+  clothing_path: string
+  drop_mesh_ids: number[]
+  drop_blend_shape_channel_ids: number[]
+  blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
+  bone_transforms: unknown[]
+}
+type AssembleWire = {
+  target_id: string
+  clothings: ClothingWire[]
+  target_drop_mesh_ids: number[]
+  target_drop_blend_shape_channel_ids: number[]
+  target_blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
+  target_bone_transforms: unknown[]
+  translate_target_morphs: boolean
+}
+
+// Two garments in one run: the backend announces each with a 'clothing'
+// event and stamps progress with clothing_index; ONE done event, ONE file.
+const TWO_CLOTHING_STREAM = [
+  { event: 'started', stem: 'classic_chic+stocking' },
+  { event: 'clothing', index: 0, stem: 'classic_chic', path: 'C:/fixtures/classic_chic.fbx' },
+  { event: 'progress', phase: 'phase_a', note: 'donor=maya score=0.96', clothing_index: 0 },
+  { event: 'progress', phase: 'phase_b', note: '12 drops (cache hit)', clothing_index: 0 },
+  { event: 'progress', phase: 'phase_c', note: 'merge complete', clothing_index: 0 },
+  { event: 'clothing', index: 1, stem: 'stocking', path: 'C:/fixtures/stocking.fbx' },
+  { event: 'progress', phase: 'phase_a', note: 'donor=maya score=1.00', clothing_index: 1 },
+  { event: 'progress', phase: 'phase_b', note: '4 drops (cache hit)', clothing_index: 1 },
+  { event: 'progress', phase: 'phase_c', note: 'merge complete', clothing_index: 1 },
+  { event: 'progress', phase: 'write', note: 'wrote merged.fbx', clothing_index: 1 },
+  { event: 'done', id: 'classic_chic+stocking', output_fbx: '/tmp/classic_chic+stocking__maya.fbx', manifest: {} },
+]
+
 // Helper that captures the JSON body of the streaming assemble POST and
 // returns a scripted NDJSON success stream. Used by tests that need to
 // inspect what the FE actually sent (drop ids, etc.).
@@ -206,18 +242,14 @@ test('assemble button posts the mesh-drop set', async ({ page }) => {
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
   expect(assembleRequests.length).toBe(1)
-  const body = assembleRequests[0] as {
-    target_id: string; clothing_path: string;
-    drop_mesh_ids: number[]; target_drop_mesh_ids: number[];
-    drop_blend_shape_channel_ids: number[];
-    target_drop_blend_shape_channel_ids: number[];
-  }
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
   expect(body.target_id).toBe('maya')
-  expect(body.clothing_path).toBe('C:/fixtures/classic_chic.fbx')
-  expect(new Set(body.drop_mesh_ids)).toEqual(new Set([13]))
+  expect(c0.clothing_path).toBe('C:/fixtures/classic_chic.fbx')
+  expect(new Set(c0.drop_mesh_ids)).toEqual(new Set([13]))
   expect(body.target_drop_mesh_ids).toEqual([])
   // No blendshape drops in this run
-  expect(body.drop_blend_shape_channel_ids).toEqual([])
+  expect(c0.drop_blend_shape_channel_ids).toEqual([])
   expect(body.target_drop_blend_shape_channel_ids).toEqual([])
 })
 
@@ -255,15 +287,11 @@ test('unchecking a target mesh forwards target_drop_mesh_ids on assemble', async
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
   expect(assembleRequests.length).toBe(1)
-  const body = assembleRequests[0] as {
-    target_id: string
-    clothing_path: string
-    drop_mesh_ids: number[]
-    target_drop_mesh_ids: number[]
-  }
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
   expect(new Set(body.target_drop_mesh_ids)).toEqual(new Set([202, 203]))
   // Clothing side has no drops
-  expect(body.drop_mesh_ids).toEqual([])
+  expect(c0.drop_mesh_ids).toEqual([])
 })
 
 test('clothing item lists blendshape channels for the modder to uncheck', async ({ page }) => {
@@ -302,11 +330,9 @@ test('unchecking blendshapes forwards drop_blend_shape_channel_ids on assemble',
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
   expect(assembleRequests.length).toBe(1)
-  const body = assembleRequests[0] as {
-    drop_blend_shape_channel_ids: number[]
-    target_drop_blend_shape_channel_ids: number[]
-  }
-  expect(new Set(body.drop_blend_shape_channel_ids)).toEqual(new Set([903]))
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
+  expect(new Set(c0.drop_blend_shape_channel_ids)).toEqual(new Set([903]))
   expect(new Set(body.target_drop_blend_shape_channel_ids)).toEqual(new Set([701]))
 })
 
@@ -333,11 +359,9 @@ test('blendshape slider sends deform_percent overrides on assemble', async ({ pa
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
   expect(assembleRequests.length).toBe(1)
-  const body = assembleRequests[0] as {
-    blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
-    target_blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
-  }
-  expect(body.blend_shape_channel_overrides).toEqual([
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
+  expect(c0.blend_shape_channel_overrides).toEqual([
     { channel_id: 902, deform_percent: 40 },
   ])
   expect(body.target_blend_shape_channel_overrides).toEqual([
@@ -366,10 +390,81 @@ test('snapping a blendshape slider back to its on-disk value clears the override
   await page.getByTestId('assemble-button').click()
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
-  const body = assembleRequests[0] as {
-    blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
-  }
-  expect(body.blend_shape_channel_overrides).toEqual([])
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
+  expect(c0.blend_shape_channel_overrides).toEqual([])
+})
+
+test('typed blendshape value accepts two decimals and is sent verbatim', async ({ page }) => {
+  // User ask (2026-09-08): the slider is integer-only; a typed field must
+  // take a value like 12.34 and ship it unchanged in the assemble payload.
+  await mockApi(page)
+  const assembleRequests: unknown[] = []
+  await captureAssembleRequests(page, assembleRequests)
+
+  await page.goto('/')
+
+  const targetPanel = page.getByTestId('target-panel')
+  const targetSmile = targetPanel.locator('[data-channel-name="TargetSmile"]')
+  await targetSmile.getByTestId('blendshape-number').fill('12.34')
+  await expect(targetSmile.getByTestId('blendshape-value')).toHaveText('12.34')
+  // The slider follows the typed value.
+  await expect(targetSmile.locator('input[type=range]')).toHaveValue('12.34')
+
+  await page.getByTestId('clothing-path-input').fill('C:/fixtures/classic_chic.fbx')
+  await page.getByTestId('clothing-add-button').click()
+  const clothing = page.getByTestId('clothing-item').first()
+  const wink = clothing.locator('[data-channel-name="Wink"]')
+  await wink.getByTestId('blendshape-number').fill('0.5')
+  await expect(wink.getByTestId('blendshape-value')).toHaveText('0.5')
+
+  await page.getByTestId('assemble-button').click()
+  await expect(page.getByTestId('assemble-result').first()).toBeVisible()
+
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
+  expect(c0.blend_shape_channel_overrides).toEqual([{ channel_id: 902, deform_percent: 0.5 }])
+  expect(body.target_blend_shape_channel_overrides).toEqual([{ channel_id: 701, deform_percent: 12.34 }])
+})
+
+test('typed blendshape value rounds to two decimals, clamps to 0..100, and clears on the on-disk value', async ({ page }) => {
+  await mockApi(page)
+  await page.goto('/')
+
+  const targetPanel = page.getByTestId('target-panel')
+  const row = targetPanel.locator('[data-channel-name="TargetBlink"]')
+  const field = row.getByTestId('blendshape-number')
+
+  await field.fill('12.346')
+  await expect(row.getByTestId('blendshape-value')).toHaveText('12.35')
+
+  await field.fill('250')
+  await expect(row.getByTestId('blendshape-value')).toHaveText('100')
+
+  await field.fill('-3')
+  await expect(row.getByTestId('blendshape-value')).toHaveText('0')
+  // 0 is TargetBlink's on-disk value, so the override is gone, not "0".
+  await expect(row).toHaveAttribute('data-has-override', '0')
+})
+
+test('blendshape slider and typed field stay in sync both ways', async ({ page }) => {
+  await mockApi(page)
+  await page.goto('/')
+
+  const targetPanel = page.getByTestId('target-panel')
+  const row = targetPanel.locator('[data-channel-name="TargetSmile"]')
+
+  await row.locator('input[type=range]').fill('40')
+  await expect(row.getByTestId('blendshape-number')).toHaveValue('40')
+
+  await row.getByTestId('blendshape-number').fill('33.33')
+  await expect(row.locator('input[type=range]')).toHaveValue('33.33')
+  await expect(row.getByTestId('blendshape-value')).toHaveText('33.33')
+
+  // A typed decimal survives a reload like any other override.
+  await page.reload()
+  const after = page.getByTestId('target-panel').locator('[data-channel-name="TargetSmile"]')
+  await expect(after.getByTestId('blendshape-number')).toHaveValue('33.33')
 })
 
 test('assemble renders a progress row with phase + note per clothing', async ({ page }) => {
@@ -446,11 +541,10 @@ test('duplicate-named blendshapes are disambiguated by owning mesh, and the slid
   await page.getByTestId('assemble-button').click()
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
-  const body = assembleRequests[0] as {
-    blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
-  }
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
   // Exactly the C_Shoes channel (910), not the B_Socks one (911).
-  expect(body.blend_shape_channel_overrides).toEqual([
+  expect(c0.blend_shape_channel_overrides).toEqual([
     { channel_id: 910, deform_percent: 62 },
   ])
 })
@@ -527,7 +621,8 @@ test('translate-target-morphs checkbox is on by default and forwards true', asyn
   await page.getByTestId('assemble-button').click()
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
-  const body = assembleRequests[0] as { translate_target_morphs: boolean }
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
   expect(body.translate_target_morphs).toBe(true)
 })
 
@@ -545,6 +640,41 @@ test('unchecking translate-target-morphs forwards false', async ({ page }) => {
   await page.getByTestId('assemble-button').click()
   await expect(page.getByTestId('assemble-result').first()).toBeVisible()
 
-  const body = assembleRequests[0] as { translate_target_morphs: boolean }
+  const body = assembleRequests[0] as AssembleWire
+  const c0 = body.clothings[0]
   expect(body.translate_target_morphs).toBe(false)
+})
+
+test('two clothings assemble as ONE merged output: single request, both garments', async ({ page }) => {
+  await mockApi(page)
+  const assembleRequests: unknown[] = []
+  await captureAssembleRequests(page, assembleRequests, TWO_CLOTHING_STREAM)
+
+  await page.goto('/')
+  await page.getByTestId('clothing-path-input').fill('C:/fixtures/classic_chic.fbx')
+  await page.getByTestId('clothing-add-button').click()
+  await page.getByTestId('clothing-path-input').fill('C:/fixtures/stocking.fbx')
+  await page.getByTestId('clothing-add-button').click()
+  await expect(page.getByTestId('clothing-item')).toHaveCount(2)
+
+  await page.getByTestId('assemble-button').click()
+
+  // ONE result — the merged file — not one per garment.
+  await expect(page.getByTestId('assemble-result')).toHaveCount(1)
+  await expect(page.getByTestId('assemble-result')).toContainText('classic_chic+stocking__maya.fbx')
+
+  // ONE request carrying both garments, in list order.
+  expect(assembleRequests.length).toBe(1)
+  const body = assembleRequests[0] as AssembleWire
+  expect(body.target_id).toBe('maya')
+  expect(body.clothings.map((c) => c.clothing_path)).toEqual([
+    'C:/fixtures/classic_chic.fbx',
+    'C:/fixtures/stocking.fbx',
+  ])
+  expect('clothing_path' in body).toBe(false)
+
+  // Progress: one row per garment, both driven from the single stream.
+  await expect(page.getByTestId('assemble-progress-row')).toHaveCount(2)
+  await expect(page.getByTestId('assemble-progress-status').nth(0)).toHaveText('done')
+  await expect(page.getByTestId('assemble-progress-status').nth(1)).toHaveText('done')
 })

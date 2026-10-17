@@ -4,6 +4,7 @@ import { storeToRefs } from 'pinia'
 import { useComposeStore } from '../stores/compose'
 import MeshList from './MeshList.vue'
 import BlendShapeList from './BlendShapeList.vue'
+import BoneTransformPanel from './BoneTransformPanel.vue'
 
 const compose = useComposeStore()
 const { target, translateTargetMorphs } = storeToRefs(compose)
@@ -52,6 +53,7 @@ const channelCount = computed(() =>
       <div v-if="channelCount > 0" class="bs-wrap">
         <BlendShapeList :source="target" heading="Blendshapes" />
       </div>
+      <BoneTransformPanel :source="target" />
     </template>
   </section>
 </template>

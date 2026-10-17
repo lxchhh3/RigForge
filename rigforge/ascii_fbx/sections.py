@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .lexer import FBXDocument, FBXNode
+from .transform import LocalTransform
 
 
 # --- args parsing ------------------------------------------------------------
@@ -259,6 +260,11 @@ class SectionView:
     def limb_bones(self) -> list[BoneRecord]:
         return self.bones_of_type("LimbNode")
 
+    def is_rigid(self) -> bool:
+        """A garment with meshes but no bones (a rigid prop, e.g. GG_headset).
+        The one predicate Phase A and the inspect API both use."""
+        return not self.limb_bones() and bool(self.bones_of_type("Mesh"))
+
     def json_records(self, *, type_classes: tuple[str, ...] = ("LimbNode",)) -> list[dict]:
         """Stable-ordered JSON records for LLM consumption."""
         recs = [b.to_json_record() for b in self.bones.values()
@@ -310,6 +316,58 @@ def _extract_translation(model: FBXNode, source: bytes) -> tuple[float, float, f
         if len(nums) >= 3:
             return (float(nums[-3]), float(nums[-2]), float(nums[-1]))
     return (0.0, 0.0, 0.0)
+
+
+def model_local_transform(view: "SectionView", model_id: int) -> Optional[LocalTransform]:
+    """Read a Model's rest-pose local transform (FBX frame): Lcl Translation /
+    Lcl Rotation / Lcl Scaling, with FBX's defaults filled in for properties
+    the exporter elided ((0,0,0), (0,0,0), (1,1,1)). None for an unknown id.
+
+    This is the read side of the bone-move feature; the write side is
+    `edits.set_model_local_transform_edits`. The inspect API converts the
+    result to Unity's frame (`transform.fbx_to_unity`) so the FE can prefill
+    the same numbers Unity's Inspector shows.
+    """
+    bone = view.bones.get(model_id)
+    if bone is None:
+        return None
+    node, source = bone.node_ref, view.document.source
+    return LocalTransform(
+        position=_extract_props_vec3(node, source, "Lcl Translation", (0.0, 0.0, 0.0)),
+        rotation=_extract_props_vec3(node, source, "Lcl Rotation", (0.0, 0.0, 0.0)),
+        scale=_extract_props_vec3(node, source, "Lcl Scaling", (1.0, 1.0, 1.0)),
+    )
+
+
+# Properties that move a Model away from plain T.R.S. `model_world_matrix`
+# does not model them, so it refuses a chain that sets any to non-zero.
+_PIVOT_PROPS = (
+    "PreRotation", "PostRotation", "RotationOffset", "RotationPivot",
+    "ScalingOffset", "ScalingPivot",
+)
+
+
+def model_world_matrix(view: "SectionView", model_id: int) -> tuple:
+    """Rest-pose world matrix (4x4, row-major, column vectors) of a Model:
+    its Lcl T.R.S composed up the parent chain. Raises ValueError if any
+    Model on the chain uses pivots / pre- or post-rotation, which this
+    composition would silently ignore."""
+    source = view.document.source
+    world = None
+    mid: Optional[int] = model_id
+    while mid is not None and mid in view.bones:
+        node = view.bones[mid].node_ref
+        for prop in _PIVOT_PROPS:
+            if any(abs(v) > 1e-9 for v in _extract_props_vec3(node, source, prop, (0.0, 0.0, 0.0))):
+                raise ValueError(
+                    f"{view.bones[mid].name!r} (id={mid}) uses {prop}; "
+                    f"its world matrix is not plain T.R.S"
+                )
+        lt = model_local_transform(view, mid)
+        local = _local_matrix(lt.position, lt.rotation, lt.scale)
+        world = local if world is None else _mat_mul(local, world)
+        mid = view.bones[mid].parent_id
+    return world if world is not None else _IDENTITY_4
 
 
 def _extract_props_vec3(model: FBXNode, source: bytes, prop_name: str,

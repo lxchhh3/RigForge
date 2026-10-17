@@ -14,6 +14,7 @@ the user uncheck named secondary chains.
 """
 from __future__ import annotations
 
+import base64
 import json
 import queue
 import re
@@ -33,11 +34,15 @@ from rigforge.ascii_fbx.sections import (
     SectionView,
     bone_to_mesh_names,
     extract as extract_sections,
+    model_local_transform,
 )
+from rigforge.ascii_fbx.transform import LocalTransform, fbx_to_unity
+from rigforge.pipeline.bone_transforms import BoneTransformEdit, BoneTransformError
 from rigforge.avatars.registry import AvatarRegistry, RegistryError
 from rigforge.canonical.schema import CanonicalSchema
 from rigforge.llm.client import LLMClient
 from rigforge.manifest import build_manifest
+from rigforge.pipeline.orchestrator import ClothingSpec
 
 
 _MANIFEST_SUFFIX = ".manifest.json"
@@ -48,6 +53,19 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 class InspectRequest(BaseModel):
     path: str
+    # The compose's target avatar. A rigid garment's move reads in this
+    # avatar's Armature frame, so its top-level meshes report their placement
+    # there (the Move panel's prefill). None = file values (no target yet).
+    target_id: Optional[str] = None
+
+
+class TasteEditRequest(BaseModel):
+    """A vertex-count-safe geometry pre-step on a clothing (e.g. cut sole
+    height). FE currently exposes only `bisect_cut`."""
+    clothing_path: str
+    mesh: str
+    op: str = "bisect_cut"
+    cut_pct: float = 0.15
 
 
 class ChannelOverride(BaseModel):
@@ -57,9 +75,65 @@ class ChannelOverride(BaseModel):
     deform_percent: float  # nominally 0-100, FBX accepts any float
 
 
+class BoneTransform(BaseModel):
+    """One bone move: set a bone's rest-pose local transform (its parent's
+    frame). The mesh weighted to the bone follows — same as dragging the bone
+    in Unity. Numbers are in `frame`: "unity" = what Unity's Inspector shows
+    (the FE default), "fbx" = raw Lcl values. A null component is untouched;
+    at least one must be given."""
+    bone_id: int
+    position: Optional[list[float]] = None
+    rotation: Optional[list[float]] = None   # Euler degrees
+    scale: Optional[list[float]] = None
+    frame: str = "unity"
+
+
+def _bone_transform_edits(
+    items: list[BoneTransform], *, field_name: str,
+) -> Optional[list[BoneTransformEdit]]:
+    """Validate + convert the request's bone moves. Arity / frame / empty
+    problems are the caller's fault → 422 with the offending bone named."""
+    if not items:
+        return None
+    out: list[BoneTransformEdit] = []
+    for it in items:
+        try:
+            t = LocalTransform.from_dict(
+                {"position": it.position, "rotation": it.rotation, "scale": it.scale}
+            )
+            if t.is_empty():
+                raise ValueError("nothing to set: give position, rotation, or scale")
+            out.append(BoneTransformEdit(bone=it.bone_id, transform=t, frame=it.frame))
+        except (ValueError, BoneTransformError) as e:
+            raise HTTPException(
+                status_code=422, detail=f"{field_name}: bone {it.bone_id}: {e}",
+            )
+    return out
+
+
+class ClothingSpecRequest(BaseModel):
+    """One garment of a compose run with its own selections (the FE's
+    per-clothing outliner state). Same field names as the flat single-
+    clothing form of AssembleRequest, minus the target_* ones."""
+    clothing_path: str
+    drop_bone_ids: list[int] = []
+    drop_mesh_ids: list[int] = []
+    drop_blend_shape_channel_ids: list[int] = []
+    blend_shape_channel_overrides: list[ChannelOverride] = []
+    bone_transforms: list[BoneTransform] = []
+    # Rigid garment (no bones) only: the TARGET bone id its meshes hang from
+    # so they follow it. None = the scene root (follows no bone).
+    attach_to_bone_id: Optional[int] = None
+
+
 class AssembleRequest(BaseModel):
     target_id: str
-    clothing_path: str
+    # ONE garment (legacy flat form: the per-clothing fields below apply to
+    # it) — or SEVERAL via `clothings`, each carrying its own selections.
+    # Several garments become ONE merged output (garment 1 onto the target,
+    # garment 2 onto that result, ...), never one file per garment.
+    clothing_path: Optional[str] = None
+    clothings: list[ClothingSpecRequest] = []
     drop_bone_ids: list[int] = []
     target_drop_bone_ids: list[int] = []
     # Mesh-id drops — what the FE outliner actually sends. Mesh-Model id,
@@ -82,14 +156,25 @@ class AssembleRequest(BaseModel):
     # the rare case a downstream Unity project binds the base avatar's morphs
     # by name. Defaults on.
     translate_target_morphs: bool = True
+    # Bone moves — one entry per bone the modder repositioned in the FE's
+    # "Move bones" panel, on the clothing and on the target respectively.
+    bone_transforms: list[BoneTransform] = []
+    target_bone_transforms: list[BoneTransform] = []
 
 
 def _build_inspect_response(
     view: SectionView, donor_id: Optional[str], donor_score: float,
+    *,
+    local_overrides: Optional[dict[int, LocalTransform]] = None,
+    rigid_frame: Optional[str] = None,
 ) -> dict:
     """Bone-tree response shared by /api/clothings/inspect and
     /api/avatars/{id}/inspect — same shape so the FE can reuse BoneTree.vue
-    and the same TS interface for both clothing donors and target avatars."""
+    and the same TS interface for both clothing donors and target avatars.
+    `local_overrides` {model id: FBX-frame transform} replaces a Model's
+    file values (a rigid mesh's placement in the target Armature frame);
+    `rigid_frame` names that frame for the FE."""
+    local_overrides = local_overrides or {}
     children_of: dict[int, list[int]] = {}
     for b in view.bones.values():
         if b.parent_id is not None:
@@ -119,6 +204,11 @@ def _build_inspect_response(
             "subtree_size": _subtree_size(b.model_id, set()),
             "cluster_weight_count": b.cluster_weight_count,
             "deforms_meshes": bone_to_mesh_names(view, b.model_id),
+            # Rest-pose local transform as Unity's Inspector will show it, so
+            # the FE's "Move bones" panel opens on the file's current values.
+            "local_transform_unity": fbx_to_unity(
+                local_overrides.get(b.model_id) or model_local_transform(view, b.model_id)
+            ).to_dict(),
         }
         for b in view.bones.values()
     ]
@@ -186,6 +276,12 @@ def _build_inspect_response(
         "donor_id": donor_id,
         "donor_score": donor_score,
         "total_bones": len(bones_out),
+        # No bones, only meshes (a rigid prop): merged as-is; the FE offers
+        # "attach to bone" for these. Same predicate as Phase A.
+        "rigid": view.is_rigid(),
+        # The Model whose frame a rigid garment's top-level mesh values are
+        # given in (the target's Armature); None = the file's own values.
+        "rigid_frame": rigid_frame,
         "bones": bones_out,
         "blend_shape_channels": channels_out,
     }
@@ -306,7 +402,35 @@ def create_app(
         except Exception:
             pass
 
-        return _build_inspect_response(view, donor_id, donor_score)
+        # A rigid garment's move reads in the target's Armature frame, so its
+        # top-level meshes open the Move panel on their placement there.
+        local_overrides: dict[int, LocalTransform] = {}
+        rigid_frame: Optional[str] = None
+        if req.target_id is not None:
+            try:
+                target_view = registry.get(req.target_id).load_ascii_view()
+            except RegistryError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if view.is_rigid():
+                from rigforge.pipeline.phase_c import (
+                    PhaseCError, rigid_local_in_frame, rigid_move_frame,
+                )
+                try:
+                    frame_id, frame_world = rigid_move_frame(target_view)
+                    if frame_id is not None:
+                        rigid_frame = target_view.bones[frame_id].name
+                        for m in view.bones_of_type("Mesh"):
+                            if m.parent_id in (None, 0):
+                                local_overrides[m.model_id] = rigid_local_in_frame(
+                                    view, m.model_id, frame_world,
+                                )
+                except PhaseCError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+
+        return _build_inspect_response(
+            view, donor_id, donor_score,
+            local_overrides=local_overrides, rigid_frame=rigid_frame,
+        )
 
     @app.get("/api/avatars/{avatar_id}/inspect")
     def inspect_avatar(avatar_id: str) -> dict:
@@ -326,11 +450,78 @@ def create_app(
         # itself.
         return _build_inspect_response(view, donor_id=avatar_id, donor_score=1.0)
 
-    def _validate_assemble_request(req: AssembleRequest) -> tuple[Path, Path, str, dict]:
+    @app.post("/api/clothings/taste-edit")
+    def taste_edit_clothing(req: TasteEditRequest) -> dict:
+        """Run a geometry pre-step (bisect_cut) on a clothing and return the
+        edited FBX path + a before/after preview (base64 PNGs) + the weight-
+        integrity check. The FE then assembles using `edited_path`."""
+        p = Path(req.clothing_path)
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {req.clothing_path}")
+        if req.op != "bisect_cut":
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported op '{req.op}' (FE supports bisect_cut)",
+            )
+        from rigforge.geometry import blender_edit
+
+        work = output_dir / "_taste_edit"
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", req.mesh) or "mesh"
+        out = work / f"{p.stem}__{safe}_cut.fbx"
+        preview = work / f"{p.stem}__{safe}_preview"
+        try:
+            rep = blender_edit.bisect_cut(
+                p, out, mesh=req.mesh, axis="z", cut_pct=req.cut_pct, preview_dir=preview,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"taste-edit failed: {e}")
+
+        ed = rep["edit"]
+        new_unweighted = ed["unweighted_verts_after"] - ed["unweighted_verts_before"]
+
+        def _b64(name: str) -> Optional[str]:
+            f = preview / name
+            if f.is_file():
+                return "data:image/png;base64," + base64.b64encode(f.read_bytes()).decode("ascii")
+            return None
+
+        return {
+            "edited_path": str(out),
+            "mesh": ed["mesh"],
+            "verts_before": ed["verts_before"],
+            "verts_after": ed["verts_after"],
+            "verts_removed": ed["verts_removed"],
+            # The integrity gate: a cut that strips skin weights off the new
+            # cut edge is NOT ok (the sole would stop following the foot).
+            "weights_ok": new_unweighted <= 0,
+            "preview_before": _b64("before_side.png"),
+            "preview_after": _b64("after_side.png"),
+        }
+
+    def _clothing_spec(c: ClothingSpecRequest, idx: int) -> ClothingSpec:
+        overrides = {o.channel_id: o.deform_percent for o in c.blend_shape_channel_overrides}
+        return ClothingSpec(
+            clothing_fbx=Path(c.clothing_path),
+            user_drop_bone_ids=set(c.drop_bone_ids) or None,
+            drop_mesh_ids=set(c.drop_mesh_ids) or None,
+            drop_blend_shape_channel_ids=set(c.drop_blend_shape_channel_ids) or None,
+            blend_shape_channel_overrides=overrides or None,
+            bone_transforms=_bone_transform_edits(
+                c.bone_transforms, field_name=f"clothings[{idx}].bone_transforms",
+            ) or None,
+            attach_to_bone_id=c.attach_to_bone_id,
+        )
+
+    def _validate_assemble_request(
+        req: AssembleRequest,
+    ) -> tuple[Optional[Path], Path, str, dict]:
         """Shared preflight for both /api/assemble and /api/assemble/stream.
 
-        Returns (clothing_path, out_fbx, stem, kwargs) where kwargs is the
-        unpacked set of drop-id sets ready to pass to assemble_fn.
+        Returns (clothing_path, out_fbx, stem, kwargs). For the legacy single
+        form `clothing_path` is the garment and kwargs carries the flat
+        per-clothing selections; for the `clothings` form `clothing_path` is
+        None and kwargs carries `clothings=[ClothingSpec, ...]`. The output
+        stem joins every garment's stem with '+'.
         Raises HTTPException on validation failure — the streaming endpoint
         translates that into a single error event before the stream closes.
         """
@@ -339,14 +530,28 @@ def create_app(
         except RegistryError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        clothing_path = Path(req.clothing_path)
-        if not clothing_path.is_file():
+        if req.clothings:
+            if req.clothing_path is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="give clothing_path OR clothings, not both",
+                )
+            raw_paths = [c.clothing_path for c in req.clothings]
+        elif req.clothing_path is not None:
+            raw_paths = [req.clothing_path]
+        else:
             raise HTTPException(
-                status_code=404, detail=f"clothing not found: {req.clothing_path}",
+                status_code=422,
+                detail="no clothing given: send clothing_path or a non-empty clothings list",
             )
+        paths = [Path(p) for p in raw_paths]
+        for raw, p in zip(raw_paths, paths):
+            if not p.is_file():
+                raise HTTPException(status_code=404, detail=f"clothing not found: {raw}")
 
-        stem = clothing_path.stem
+        stem = "+".join(p.stem for p in paths)
         out_fbx = output_dir / f"{stem}__{req.target_id}.fbx"
+        clothing_path: Optional[Path] = None if req.clothings else paths[0]
 
         drop_ids: Optional[set[int]] = set(req.drop_bone_ids) if req.drop_bone_ids else None
         target_drop_ids: Optional[set[int]] = (
@@ -374,21 +579,36 @@ def create_app(
             {o.channel_id: o.deform_percent for o in req.target_blend_shape_channel_overrides}
             if req.target_blend_shape_channel_overrides else None
         )
+        bone_transforms = _bone_transform_edits(
+            req.bone_transforms, field_name="bone_transforms",
+        )
+        target_bone_transforms = _bone_transform_edits(
+            req.target_bone_transforms, field_name="target_bone_transforms",
+        )
 
         kwargs = {
             # Same cache dir the inspect endpoint uses — keeps the FE's part
             # ids aligned with Phase A's view (one shared bin→ASCII conversion).
             "ascii_cache_dir": output_dir / "_fbx_ascii_cache",
-            "user_drop_bone_ids": drop_ids,
             "target_drop_bone_ids": target_drop_ids,
-            "drop_mesh_ids": drop_mesh,
             "target_drop_mesh_ids": target_drop_mesh,
-            "drop_blend_shape_channel_ids": drop_channels,
             "target_drop_blend_shape_channel_ids": target_drop_channels,
-            "blend_shape_channel_overrides": channel_overrides,
             "target_blend_shape_channel_overrides": target_channel_overrides,
             "translate_target_morphs": req.translate_target_morphs,
+            "target_bone_transforms": target_bone_transforms,
         }
+        if req.clothings:
+            kwargs["clothings"] = [
+                _clothing_spec(c, i) for i, c in enumerate(req.clothings)
+            ]
+        else:
+            kwargs.update({
+                "user_drop_bone_ids": drop_ids,
+                "drop_mesh_ids": drop_mesh,
+                "drop_blend_shape_channel_ids": drop_channels,
+                "blend_shape_channel_overrides": channel_overrides,
+                "bone_transforms": bone_transforms,
+            })
         return clothing_path, out_fbx, stem, kwargs
 
     def _write_manifest_and_response(run, stem: str, out_fbx: Path) -> dict:
@@ -406,9 +626,10 @@ def create_app(
     @app.post("/api/assemble")
     def assemble_clothing(req: AssembleRequest) -> dict:
         clothing_path, out_fbx, stem, kwargs = _validate_assemble_request(req)
+        if clothing_path is not None:
+            kwargs["clothing_fbx"] = clothing_path
         try:
             run = assemble_fn(
-                clothing_fbx=clothing_path,
                 target_id=req.target_id,
                 out_fbx=out_fbx,
                 registry=registry,
@@ -433,18 +654,39 @@ def create_app(
         2xx "we started running it" case streams.
         """
         clothing_path, out_fbx, stem, kwargs = _validate_assemble_request(req)
+        if clothing_path is not None:
+            kwargs["clothing_fbx"] = clothing_path
+        clothing_paths = (
+            [c.clothing_path for c in req.clothings] if req.clothings
+            else [req.clothing_path]
+        )
 
         events: queue.Queue = queue.Queue()
         # Sentinel to terminate the generator.
         _DONE = object()
+        # Index of the garment whose phases are streaming. The orchestrator
+        # announces each garment with a 'clothing' callback (in merge order);
+        # every later progress event is stamped with clothing_index so the FE
+        # drives one progress row per garment from this single stream.
+        current = {"index": -1}
 
         def on_progress(phase: str, note: str) -> None:
-            events.put({"event": "progress", "phase": phase, "note": note})
+            if phase == "clothing":
+                current["index"] += 1
+                i = current["index"]
+                events.put({
+                    "event": "clothing", "index": i, "stem": note,
+                    "path": clothing_paths[i] if i < len(clothing_paths) else None,
+                })
+                return
+            events.put({
+                "event": "progress", "phase": phase, "note": note,
+                "clothing_index": max(current["index"], 0),
+            })
 
         def worker() -> None:
             try:
                 run = assemble_fn(
-                    clothing_fbx=clothing_path,
                     target_id=req.target_id,
                     out_fbx=out_fbx,
                     registry=registry,

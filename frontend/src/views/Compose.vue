@@ -94,9 +94,10 @@ async function runAssemble() {
     <AssembleProgressList />
 
     <section v-if="results.length > 0" class="results" data-testid="assemble-results">
-      <h2>Results</h2>
+      <h2>Result</h2>
       <ul>
-        <li v-for="r in results" :key="r.id" data-testid="assemble-result">
+        <li v-for="r in results" :key="r.id" data-testid="assemble-result"
+            :title="`merged: ${r.clothingPath}`">
           <span class="id">{{ r.id }}</span>
           <span class="arrow">→</span>
           <span class="out">{{ r.output_fbx }}</span>

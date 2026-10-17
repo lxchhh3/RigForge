@@ -98,15 +98,54 @@ def rule_required_roles_present(
     view: SectionView,
     schema: CanonicalSchema,
 ) -> list[Violation]:
-    """Every required role has at least one kept bone."""
+    """Every required role has at least one kept bone — with one carve-out.
+
+    Two different things can leave a required role without a kept bone:
+
+      * the LLM assigned the role to some bone(s) but dropped every one of
+        them → **error**. A load-bearing canonical bone is repointed onto the
+        target in Phase C; dropping it is never right, and the re-prompt
+        gives the LLM a chance to fix it.
+      * no bone was assigned the role at all → **warning**. A PARTIAL garment
+        (stockings, gloves, a hat) ships only the part of the skeleton it is
+        skinned to — a legs-only stocking has no Head or UpperArm bone
+        anywhere in the file, so there is nothing to merge for those roles.
+        Hard-failing here (and re-prompting) only pressures the LLM to force
+        a required role onto the wrong bone. The warning lands in the
+        manifest so the partial merge is on record.
+
+    Note that rule 5 (hierarchy_consistency) still demands required
+    ancestors for every kept canonical bone, so an arm chain with a missing
+    UpperArm, or a leg chain with no Hips, remains an error there.
+    """
     out: list[Violation] = []
     kept = decisions.kept_by_role()
+    assigned: dict[str, list[int]] = {}
+    for d in decisions.bones:
+        assigned.setdefault(d.role, []).append(d.model_id)
     for r in schema.required_roles:
-        if r not in kept or not kept[r]:
+        if kept.get(r):
+            continue
+        ids = assigned.get(r, [])
+        if ids:
             out.append(Violation(
                 severity="error",
                 rule="required_roles_present",
-                message=f"required role '{r}' has no kept bone",
+                message=(
+                    f"required role '{r}' has no kept bone "
+                    f"({len(ids)} bone(s) assigned the role, all dropped)"
+                ),
+                bone_ids=ids,
+            ))
+        else:
+            out.append(Violation(
+                severity="warning",
+                rule="required_roles_present",
+                message=(
+                    f"required role '{r}' is absent from this garment "
+                    f"(no bone assigned; partial garment — nothing to merge "
+                    f"for that role)"
+                ),
             ))
     return out
 

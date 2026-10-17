@@ -8,6 +8,7 @@ import pytest
 from rigforge.ascii_fbx.edits import (
     EditError,
     TextEdit,
+    add_scaled_blend_shape_channel_edits,
     apply_edits,
     drop_blend_shape_channel_edits,
     drop_bone_edits,
@@ -18,9 +19,10 @@ from rigforge.ascii_fbx.edits import (
     rename_bone_edits,
     rename_mesh_edits,
     set_blend_shape_channel_deform_percent_edits,
+    set_model_local_transform_edits,
 )
 from rigforge.ascii_fbx.lexer import parse
-from rigforge.ascii_fbx.sections import extract
+from rigforge.ascii_fbx.sections import extract, model_local_transform
 
 
 # Two-bone rig: Hips (root) -> Spine. Cluster on Hips.
@@ -524,6 +526,114 @@ def test_set_deform_percent_on_non_channel_id_returns_empty():
     assert set_blend_shape_channel_deform_percent_edits(view, 700, 50) == []
 
 
+
+# --- add a scaled copy of a blendshape channel -------------------------------
+
+# One mesh, one BlendShape deformer, one channel "In" whose Shape moves two
+# vertices (0 and 2) — the shape of GG_headset's 内 key in miniature.
+SHAPE_FBX = b"""\
+; FBX 7.4.0 project file
+Objects:  {
+\tGeometry: 300, "Geometry::Visor", "Mesh" {
+\t\tVertices: *9 {
+\t\t\ta: 0,0,0,0.1,0,0,0,0.1,0
+\t\t}
+\t\tPolygonVertexIndex: *3 {
+\t\t\ta: 0,1,-3
+\t\t}
+\t}
+\tGeometry: 400, "Geometry::In", "Shape" {
+\t\tVersion: 100
+\t\tIndexes: *2 {
+\t\t\ta: 0,2
+\t\t}
+\t\tVertices: *6 {
+\t\t\ta: -0.01,0,0,0.02,0,0.5
+\t\t}
+\t\tNormals: *6 {
+\t\t\ta: 0.1,0,0,0,0.2,0
+\t\t}
+\t}
+\tDeformer: 700, "Deformer::Visor", "BlendShape" {
+\t\tVersion: 100
+\t}
+\tDeformer: 800, "SubDeformer::In", "BlendShapeChannel" {
+\t\tVersion: 100
+\t\tDeformPercent: 0
+\t\tFullWeights: *1 {
+\t\t\ta: 100
+\t\t}
+\t}
+}
+Connections:  {
+\tC: "OO",700,300
+\tC: "OO",800,700
+\tC: "OO",400,800
+}
+"""
+
+
+def _shape_arrays(view, channel_id):
+    """(Indexes, Vertices, Normals) of the one Shape feeding a channel."""
+    from rigforge.ascii_fbx.edits import iter_oo_connections
+    from rigforge.ascii_fbx.sections import parse_args
+    src = view.document.source
+    shape_ids = [s for s, d in iter_oo_connections(view) if d == channel_id]
+    assert len(shape_ids) == 1, shape_ids
+    (node,) = [o for o in view.document.root("Objects").children
+               if o.name == "Geometry" and parse_args(o.args_bytes(src))[0][1] == shape_ids[0]]
+    out = {}
+    for child in node.children:
+        if child.name in ("Indexes", "Vertices", "Normals"):
+            a = child.child("a")
+            out[child.name] = [float(x[1]) for x in parse_args(a.args_bytes(src)) if x[0] == "num"]
+    return out
+
+
+def _deform_percent(view, channel_id):
+    ch = view.blend_shape_channels[channel_id]
+    (dp,) = [c for c in ch.node_ref.children if c.name == "DeformPercent"]
+    return float(dp.args_bytes(view.document.source).strip())
+
+
+def test_add_scaled_channel_is_the_source_shape_times_factor():
+    """kevin's GG headset (2026-10-15): worn round the neck the cups need more
+    'in' than the author's 内 gives, as a key of its own. The new channel is
+    the source's Shape scaled — same vertices, deltas x factor — on the same
+    BlendShape deformer, at the requested DeformPercent."""
+    view = extract(parse(SHAPE_FBX))
+    edits = add_scaled_blend_shape_channel_edits(view, 800, "内_neck", 2.2, deform_percent=100)
+    out = extract(parse(apply_edits(SHAPE_FBX, edits)))
+
+    (new,) = [c for c in out.blend_shape_channels.values() if c.name == "内_neck"]
+    assert new.blend_shape_id == 700
+    assert _deform_percent(out, new.channel_id) == 100
+    got = _shape_arrays(out, new.channel_id)
+    assert got["Indexes"] == [0, 2]
+    assert got["Vertices"] == pytest.approx([-0.022, 0, 0, 0.044, 0, 1.1])
+    assert got["Normals"] == pytest.approx([0.22, 0, 0, 0, 0.44, 0])
+    # the source key is untouched
+    assert _shape_arrays(out, 800)["Vertices"] == pytest.approx([-0.01, 0, 0, 0.02, 0, 0.5])
+    assert _deform_percent(out, 800) == 0
+    # fresh ids: no Objects entry shares one
+    from rigforge.ascii_fbx.sections import parse_args
+    src = out.document.source
+    ids = [parse_args(o.args_bytes(src))[0][1] for o in out.document.root("Objects").children]
+    assert len(ids) == len(set(ids)) == 6
+
+
+def test_add_scaled_channel_unknown_source_raises():
+    view = extract(parse(SHAPE_FBX))
+    with pytest.raises(EditError, match="no blendshape channel"):
+        add_scaled_blend_shape_channel_edits(view, 9999, "X", 2.0)
+
+
+def test_add_scaled_channel_refuses_a_name_its_deformer_already_has():
+    view = extract(parse(SHAPE_FBX))
+    with pytest.raises(EditError, match="already has"):
+        add_scaled_blend_shape_channel_edits(view, 800, "In", 2.0)
+
+
 # --- rename edits ------------------------------------------------------------
 
 
@@ -683,3 +793,122 @@ def test_rename_mesh_on_non_mesh_model_is_noop():
 def test_rename_mesh_stale_id_is_noop():
     view = extract(parse(MORPH_MESH_FBX))
     assert rename_mesh_edits(view, 99999, "X") == []
+
+
+# --- bone move: set_model_local_transform_edits ------------------------------
+#
+# A bone move is a rest-pose edit of the Model's Lcl Translation / Lcl
+# Rotation / Lcl Scaling properties. The bind pose (cluster TransformLink)
+# is untouched, so the skinned mesh follows the bone — same as dragging the
+# bone in Unity. Values here are FBX-frame; Unity conversion lives in
+# transform.py and is tested separately.
+
+
+def test_set_local_transform_rewrites_translation_values():
+    """Only the three numeric values change; the property name/type text,
+    the sibling bone, and the rest of the file stay byte-identical."""
+    view = extract(parse(MINI_FBX))
+    edits = set_model_local_transform_edits(view, 100, translation=(0.1, 0.9, -0.2))
+    assert len(edits) == 1
+    out = apply_edits(MINI_FBX, edits)
+    assert b'P: "Lcl Translation", "Lcl Translation", "", "A",0.1,0.9,-0.2\n' in out
+    # Spine untouched.
+    assert b'P: "Lcl Translation", "Lcl Translation", "", "A",0,0.1,0\n' in out
+    out_view = extract(parse(out))
+    assert model_local_transform(out_view, 100).position == (0.1, 0.9, -0.2)
+    assert out_view.bones[100].translation_xyz == (0.1, 0.9, -0.2)
+    # Everything outside the edited span is identical.
+    assert out.replace(b"0.1,0.9,-0.2", b"0,0.9,0") == MINI_FBX
+
+
+def test_set_local_transform_inserts_missing_rotation_and_scale():
+    """Bones commonly omit Lcl Rotation / Lcl Scaling when they are at the
+    default (FBX SDK elides them). Setting one must INSERT the property line
+    with the same indentation as its siblings, not silently no-op."""
+    view = extract(parse(MINI_FBX))
+    edits = set_model_local_transform_edits(
+        view, 100, rotation_deg=(10, 20.5, -30), scale=(2, 2, 2),
+    )
+    # Both missing lines go in as ONE insertion at the same point.
+    assert len(edits) == 1 and edits[0].start == edits[0].end
+    out = apply_edits(MINI_FBX, edits)
+    assert b'\n\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A",10,20.5,-30\n' in out
+    assert b'\n\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A",2,2,2\n' in out
+    out_view = extract(parse(out))
+    t = model_local_transform(out_view, 100)
+    assert t.position == (0.0, 0.9, 0.0)      # untouched
+    assert t.rotation == (10.0, 20.5, -30.0)
+    assert t.scale == (2.0, 2.0, 2.0)
+    # Spine (101) still has no rotation/scale lines -> defaults.
+    s = model_local_transform(out_view, 101)
+    assert s.rotation == (0.0, 0.0, 0.0) and s.scale == (1.0, 1.0, 1.0)
+
+
+def test_set_local_transform_all_three_at_once_apply_cleanly():
+    view = extract(parse(MINI_FBX))
+    edits = set_model_local_transform_edits(
+        view, 101, translation=(1, 2, 3), rotation_deg=(4, 5, 6), scale=(7, 8, 9),
+    )
+    out = apply_edits(MINI_FBX, edits)   # must not overlap
+    t = model_local_transform(extract(parse(out)), 101)
+    assert (t.position, t.rotation, t.scale) == ((1, 2, 3), (4, 5, 6), (7, 8, 9))
+
+
+def test_set_local_transform_unknown_model_returns_empty():
+    view = extract(parse(MINI_FBX))
+    assert set_model_local_transform_edits(view, 99999, translation=(1, 1, 1)) == []
+
+
+def test_set_local_transform_nothing_requested_returns_empty():
+    view = extract(parse(MINI_FBX))
+    assert set_model_local_transform_edits(view, 100) == []
+
+
+def test_set_local_transform_missing_properties70_raises():
+    """A Model with no Properties70 block at all is not something we patch
+    silently — surface it so the caller can report the bone."""
+    fbx = MINI_FBX.replace(
+        b'\tModel: 101, "Model::Spine", "LimbNode" {\n'
+        b'\t\tProperties70:  {\n'
+        b'\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A",0,0.1,0\n'
+        b'\t\t}\n',
+        b'\tModel: 101, "Model::Spine", "LimbNode" {\n',
+    )
+    assert b"Properties70" in fbx  # Hips still has one
+    view = extract(parse(fbx))
+    with pytest.raises(EditError):
+        set_model_local_transform_edits(view, 101, translation=(1, 1, 1))
+
+
+def test_set_local_transform_number_formatting():
+    """Whole numbers print bare; fractions print shortest-round-trip so the
+    value that lands in the file is exactly what was asked for."""
+    view = extract(parse(MINI_FBX))
+    edits = set_model_local_transform_edits(
+        view, 100, translation=(0.0, 1.0, 0.0787041112780571),
+    )
+    assert edits[0].replacement == b"0,1,0.0787041112780571"
+
+
+def test_set_local_transform_does_not_overlap_with_rename():
+    """Rename edits the quoted name in the Model's arg span; the transform
+    edit lives inside the body. Both must apply together."""
+    view = extract(parse(MINI_FBX))
+    bone = view.bones[100]
+    edits = rename_bone_edits(view, bone, "Pelvis")
+    edits += set_model_local_transform_edits(view, 100, translation=(0, 1, 0))
+    out = apply_edits(MINI_FBX, edits)
+    out_view = extract(parse(out))
+    assert out_view.bones[100].name == "Pelvis"
+    assert out_view.bones[100].translation_xyz == (0.0, 1.0, 0.0)
+
+
+def test_model_local_transform_reads_defaults_and_values(maya_fbx_ascii: Path):
+    """The read side on the real Maya file: every LimbNode resolves, and a
+    bone with explicit rotation reads it back."""
+    view = extract(parse(maya_fbx_ascii.read_bytes()))
+    for b in view.limb_bones():
+        t = model_local_transform(view, b.model_id)
+        assert t.position == b.translation_xyz
+        assert t.rotation is not None and t.scale is not None
+    assert model_local_transform(view, 99999) is None

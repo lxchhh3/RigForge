@@ -33,35 +33,236 @@ from dataclasses import dataclass
 from typing import Optional
 
 from rigforge.ascii_fbx.edits import (
+    EditError,
     TextEdit,
     apply_edits,
     drop_blend_shape_channel_edits,
     drop_bone_edits,
     drop_mesh_edits,
     drop_node_edit,
+    mesh_blend_shape_channel_ids,
+    mesh_cluster_ids,
     rename_blend_shape_channel_edits,
     rename_bone_edits,
     rename_geometry_edits,
     rename_mesh_edits,
     set_blend_shape_channel_deform_percent_edits,
+    set_model_local_transform_edits,
 )
 from rigforge.ascii_fbx.lexer import parse as parse_fbx
 from rigforge.ascii_fbx.merge import (
     bone_keep_strip_edits,
     id_offset_edits,
+    positioned_args,
     splice_into_section_edit,
     zero_weight_leaf_bone_ids,
 )
-from rigforge.ascii_fbx.sections import SectionView, _extract_props_vec3, extract
+from rigforge.ascii_fbx.sections import (
+    _IDENTITY_4,
+    SectionView,
+    _extract_props_vec3,
+    _local_matrix,
+    _mat_mul,
+    extract,
+    model_world_matrix,
+)
+from rigforge.ascii_fbx.transform import LocalTransform, affine_inverse, affine_to_fbx_local
 from rigforge.avatars.registry import AvatarRegistry, CuratedAvatar
 from rigforge.canonical.decisions import DecisionSet
 from rigforge.naming import load_translation_table, translate_name
 
+from .bone_transforms import (
+    BoneTransformEdit,
+    BoneTransformError,
+    resolve_bone_transform_edits,
+)
 from .edit_plan import EditPlan
 
 
 class PhaseCError(RuntimeError):
     pass
+
+
+def _bone_transform_edits(
+    view: SectionView,
+    requested: list[BoneTransformEdit],
+    *,
+    untouchable: set[int],
+    untouchable_reason: str,
+    side: str,
+    notes: list[str],
+    handled: frozenset[int] = frozenset(),
+) -> list[TextEdit]:
+    """Resolve requested bone moves against `view` and turn them into edits.
+
+    `untouchable` are Model ids whose bytes another pass is about to remove
+    (dropped bones/meshes, or clothing bones the merge replaces with the
+    target's copy) — a move there would overlap that removal, so it is
+    skipped with a note pointing at `untouchable_reason`.
+    """
+    if not requested:
+        return []
+    try:
+        resolved = resolve_bone_transform_edits(view, requested, notes=notes, side=side)
+    except BoneTransformError as exc:
+        raise PhaseCError(str(exc)) from exc
+    edits: list[TextEdit] = []
+    moved = 0
+    for mid, t in resolved.items():
+        if mid in handled:   # the attach step already wrote this Model's transform
+            continue
+        if mid in untouchable:
+            bone = view.bones.get(mid)
+            name = bone.name if bone is not None else "?"
+            notes.append(
+                f"skip: bone_transform ({side}) on {name!r} (id={mid}) — "
+                f"{untouchable_reason}"
+            )
+            continue
+        try:
+            t_edits = set_model_local_transform_edits(
+                view, mid, translation=t.position, rotation_deg=t.rotation, scale=t.scale,
+            )
+        except EditError as exc:
+            raise PhaseCError(f"bone_transform ({side}) failed on id={mid}: {exc}") from exc
+        if t_edits:
+            edits.extend(t_edits)
+            moved += 1
+    if moved:
+        notes.append(f"bone_transform: moved {moved} {side} bones")
+    return edits
+
+
+def rigid_move_frame(target_view: SectionView) -> tuple[Optional[int], tuple]:
+    """The frame a rigid garment's move reads in: the target's armature Null
+    — in Unity the prop sits under the avatar's Armature (kevin's GG.unity:
+    the headset is a child of Maya's Armature), so its Inspector numbers are
+    Armature-local. Returns (armature id, its world matrix); (None, identity)
+    when the target has no armature Null — then the scene root is the frame."""
+    arm = _find_target_armature_null(target_view)
+    if arm is None:
+        return None, _IDENTITY_4
+    try:
+        return arm, model_world_matrix(target_view, arm)
+    except ValueError as exc:
+        raise PhaseCError(f"rigid: cannot read the target armature's frame: {exc}") from exc
+
+
+def rigid_local_in_frame(
+    clothing_view: SectionView, mesh_id: int, frame_world: tuple,
+) -> LocalTransform:
+    """A rigid garment's top-level mesh placement (its file values) re-expressed
+    in the move frame `frame_world` — what the FE's Move panel opens on."""
+    try:
+        return affine_to_fbx_local(_mat_mul(
+            affine_inverse(frame_world), model_world_matrix(clothing_view, mesh_id),
+        ))
+    except ValueError as exc:
+        name = clothing_view.bones[mesh_id].name
+        raise PhaseCError(f"rigid: {name!r}: {exc}") from exc
+
+
+def _place_rigid_edits(
+    clothing_view: SectionView,
+    target_view: SectionView,
+    attach_to_bone_id: Optional[int],
+    bone_transforms: list[BoneTransformEdit],
+    *,
+    skip: set[int],
+    attached: dict[int, int],
+    notes: list[str],
+) -> list[TextEdit]:
+    """Hang a rigid garment's top-level meshes from TARGET bone
+    `attach_to_bone_id` (so they follow it), else from the target's Armature
+    (as in Unity), keeping their world placement — only the parent changes,
+    like dragging them there in Unity's Hierarchy. A requested move on such a
+    mesh is folded in first; it reads in the Armature frame
+    (`rigid_move_frame`). Fills `attached` {clothing mesh id: parent id} for
+    the parent-link rewrite. With no armature and no bone the meshes stay at
+    the scene root and the plain move pass applies their move there."""
+    frame_id, frame_world = rigid_move_frame(target_view)
+    if attach_to_bone_id is not None:
+        parent = target_view.bones.get(attach_to_bone_id)
+        if parent is None or parent.type_class != "LimbNode":
+            raise PhaseCError(f"attach: id={attach_to_bone_id} is not a bone of the target")
+        parent_id = attach_to_bone_id
+    elif frame_id is not None:
+        parent_id = frame_id
+        parent = target_view.bones[frame_id]
+    else:
+        return []
+    try:
+        to_parent = affine_inverse(model_world_matrix(target_view, parent_id))
+    except ValueError as exc:
+        raise PhaseCError(f"attach: cannot hang from {parent.name!r}: {exc}") from exc
+    try:
+        moves = resolve_bone_transform_edits(
+            clothing_view, bone_transforms, notes=[], side="clothing",
+        )
+    except BoneTransformError as exc:
+        raise PhaseCError(str(exc)) from exc
+
+    edits: list[TextEdit] = []
+    for m in clothing_view.bones_of_type("Mesh"):
+        if m.parent_id not in (None, 0) or m.model_id in skip:
+            continue
+        cur = rigid_local_in_frame(clothing_view, m.model_id, frame_world)
+        mv = moves.get(m.model_id) or LocalTransform()
+        pos = mv.position if mv.position is not None else cur.position
+        rot = mv.rotation if mv.rotation is not None else cur.rotation
+        scl = mv.scale if mv.scale is not None else cur.scale
+        world = _mat_mul(frame_world, _local_matrix(pos, rot, scl))
+        try:
+            local = affine_to_fbx_local(_mat_mul(to_parent, world))
+        except ValueError as exc:
+            raise PhaseCError(f"attach: {m.name!r} onto {parent.name!r}: {exc}") from exc
+        try:
+            edits.extend(set_model_local_transform_edits(
+                clothing_view, m.model_id, translation=local.position,
+                rotation_deg=local.rotation, scale=local.scale,
+            ))
+        except EditError as exc:
+            raise PhaseCError(f"attach: {m.name!r}: {exc}") from exc
+        attached[m.model_id] = parent_id
+    if not attached:
+        if attach_to_bone_id is not None:
+            raise PhaseCError("attach: the garment has no top-level mesh to hang")
+        return edits
+    names = ", ".join(repr(clothing_view.bones[i].name) for i in attached)
+    frame = repr(target_view.bones[frame_id].name) if frame_id is not None else "scene-root"
+    kind = "target bone" if attach_to_bone_id is not None else "target armature"
+    notes.append(
+        f"attach: {names} -> {kind} {parent.name!r} (id={parent_id}), "
+        f"world placement kept; move read in the {frame} frame"
+    )
+    return edits
+
+
+def _reparent_root_links(ascii_bytes: bytes, new_parent: dict[int, int]) -> bytes:
+    """Rewrite `C: "OO",<child>,0` to `C: "OO",<child>,<new parent>` for each
+    child in `new_parent` (ids as they stand AFTER the offset pass)."""
+    doc = parse_fbx(ascii_bytes)
+    conns = doc.root("Connections")
+    source = doc.source
+    edits: list[TextEdit] = []
+    found: set[int] = set()
+    for conn in (conns.children if conns is not None else []):
+        if conn.name != "C":
+            continue
+        a0, a1 = conn.args_span
+        toks = positioned_args(source[a0:a1])
+        if (len(toks) == 3 and toks[0].kind == "str" and toks[0].value == "OO"
+                and toks[1].kind == "num" and toks[2].kind == "num"
+                and toks[1].value in new_parent and toks[2].value == 0):
+            edits.append(TextEdit(
+                a0 + toks[2].start, a0 + toks[2].end,
+                str(new_parent[toks[1].value]).encode("ascii"),
+            ))
+            found.add(toks[1].value)
+    missing = set(new_parent) - found
+    if missing:
+        raise PhaseCError(f"attach: no scene-root link found for ids {sorted(missing)}")
+    return apply_edits(ascii_bytes, edits)
 
 
 def _translate_morph_and_mesh_edits(
@@ -204,6 +405,11 @@ def run_phase_c(
     blend_shape_channel_overrides: Optional[dict[int, float]] = None,
     target_blend_shape_channel_overrides: Optional[dict[int, float]] = None,
     translate_target_morphs: bool = True,
+    bone_transforms: Optional[list[BoneTransformEdit]] = None,
+    target_bone_transforms: Optional[list[BoneTransformEdit]] = None,
+    attach_to_bone_id: Optional[int] = None,
+    target_ascii: Optional[bytes] = None,
+    zero_weight_sweep: bool = True,
 ) -> PhaseCResult:
     """Apply EditPlan to clothing ASCII, then merge with target if needed.
 
@@ -231,11 +437,35 @@ def run_phase_c(
     ALWAYS translated (no external name binding to break); the target's are
     behind this flag — the FE checkbox — for the rare case where a downstream
     Unity project binds the base avatar's morphs by name.
+    `bone_transforms` / `target_bone_transforms` move bones: each sets a
+    bone's rest-pose local position/rotation/scale (the skin bind pose is
+    untouched, so the mesh follows — same as dragging the bone in Unity).
+    Clothing bones the merge replaces with the target's copy, and dropped
+    bones/meshes on either side, are skipped with a note.
+    `attach_to_bone_id` (a rigid garment only - no bones): hang its top-level
+    meshes from this TARGET bone so they follow it; without it a rigid
+    garment hangs from the target's Armature. Like dragging them there in
+    Unity's Hierarchy, they keep their world placement (their move above
+    reads in the Armature frame — Unity's numbers for a prop under the
+    avatar's Armature) and only the parent changes.
+    `target_ascii` (chained compose): merge onto THIS ASCII — the previous
+    garment's merged output — instead of the registry's bare avatar, so N
+    garments end up in ONE file on one shared skeleton. The curated avatar
+    still supplies names/roles/canonical ids (target ids survive a merge
+    unchanged; only clothing ids get offset), so nothing else changes.
+    `zero_weight_sweep=False` defers the post-merge leaf-bone sweep. Used on
+    intermediate merges so a later garment can still bind to a target bone
+    the earlier ones left weightless; the final merge sweeps once.
     """
     notes: list[str] = []
 
     target_avatar = registry.get(target_id)
-    target_view = target_avatar.load_ascii_view()
+    if target_ascii is None:
+        target_ascii = target_avatar.load_ascii_bytes()
+        target_view = target_avatar.load_ascii_view()
+    else:
+        target_view = extract(parse_fbx(target_ascii))
+        notes.append("merge: chained — target is the previous garment's merged output")
 
     # Build the donor→target bone repoint table. Two strategies depending on
     # whether the clothing was rigged for THIS curated avatar already.
@@ -271,6 +501,11 @@ def run_phase_c(
         blend_shape_channel_overrides=blend_shape_channel_overrides or {},
         target_blend_shape_channel_overrides=target_blend_shape_channel_overrides or {},
         translate_target_morphs=translate_target_morphs,
+        bone_transforms=bone_transforms or [],
+        target_bone_transforms=target_bone_transforms or [],
+        attach_to_bone_id=attach_to_bone_id,
+        target_ascii=target_ascii,
+        zero_weight_sweep=zero_weight_sweep,
         notes=notes,
     )
     return PhaseCResult(merged_ascii=merged, notes=notes)
@@ -394,6 +629,11 @@ def _run_merge(
     blend_shape_channel_overrides: dict[int, float],
     target_blend_shape_channel_overrides: dict[int, float],
     translate_target_morphs: bool,
+    bone_transforms: list[BoneTransformEdit],
+    target_bone_transforms: list[BoneTransformEdit],
+    attach_to_bone_id: Optional[int],
+    target_ascii: bytes,
+    zero_weight_sweep: bool,
     notes: list[str],
 ) -> bytes:
     # `repoint_table` + `kept_bone_ids` come pre-built from one of the two
@@ -406,6 +646,12 @@ def _run_merge(
     #    how secondary chains (Hair, Breast, ornament bones) get reparented
     #    onto the target armature.
     dropped_ids = set(edit_plan.drops)
+    # Clusters that the user's clothing-side mesh drops (applied further down)
+    # will delete wholesale. The rename pass below must not rewrite a name
+    # INSIDE one of these blocks — see rename_bone_edits(skip_cluster_ids=...).
+    doomed_cluster_ids: set[int] = set()
+    for _mid in drop_mesh_ids:
+        doomed_cluster_ids |= mesh_cluster_ids(clothing_view, _mid)
     strip_edits: list[TextEdit] = []
     for bid in kept_bone_ids:
         bone = clothing_view.bones.get(bid)
@@ -438,7 +684,9 @@ def _run_merge(
         if bone is None:
             notes.append(f"skip: rename bone id={bid} not in clothing view")
             continue
-        strip_edits.extend(rename_bone_edits(clothing_view, bone, new_name))
+        strip_edits.extend(rename_bone_edits(
+            clothing_view, bone, new_name, skip_cluster_ids=doomed_cluster_ids,
+        ))
         renamed += 1
     if edit_plan.renames:
         notes.append(
@@ -510,11 +758,23 @@ def _run_merge(
 
     # Apply DeformPercent overrides on the clothing side. Skip channels in
     # the drop set — the node is about to vanish; overriding a doomed node
-    # would produce overlapping edits.
+    # would produce overlapping edits. The same goes for channels owned by a
+    # mesh the user dropped: drop_mesh_edits cascades into them (FE flow:
+    # slider moved, then the mesh unchecked).
+    doomed_channel_ids: set[int] = set()
+    for _mid in drop_mesh_ids:
+        doomed_channel_ids |= mesh_blend_shape_channel_ids(clothing_view, _mid)
     if blend_shape_channel_overrides:
         applied = 0
         for cid, pct in blend_shape_channel_overrides.items():
             if cid in drop_blend_shape_channel_ids:
+                continue
+            if cid in doomed_channel_ids:
+                ch = clothing_view.blend_shape_channels.get(cid)
+                notes.append(
+                    f"skip: override on channel {ch.name if ch else cid!r} "
+                    f"(id={cid}) — its clothing mesh is dropped"
+                )
                 continue
             channel_edits = set_blend_shape_channel_deform_percent_edits(
                 clothing_view, cid, pct,
@@ -526,6 +786,29 @@ def _run_merge(
             notes.append(
                 f"override: set DeformPercent on {applied} clothing channels"
             )
+
+    # Bone moves on the clothing side. Bones the merge replaces with the
+    # target's copy (kept_bone_ids) or drops have their Models stripped below,
+    # so a move on one has nothing to land on — skipped with a note; the
+    # target-side list is where a canonical bone gets moved.
+    # Place a rigid garment: its top-level meshes hang from the attach bone,
+    # else from the target's Armature (as in Unity), re-expressed in that
+    # parent's frame (world placement kept, the Armature-frame move folded
+    # in); their parent link is rewritten after the offset pass below.
+    attached: dict[int, int] = {}
+    if attach_to_bone_id is not None or clothing_view.is_rigid():
+        strip_edits.extend(_place_rigid_edits(
+            clothing_view, target_view, attach_to_bone_id, bone_transforms,
+            skip=set(drop_mesh_ids), attached=attached, notes=notes,
+        ))
+    strip_edits.extend(_bone_transform_edits(
+        clothing_view, bone_transforms,
+        untouchable=kept_bone_ids | dropped_ids | set(drop_mesh_ids),
+        untouchable_reason=(
+            "replaced by the target's copy or dropped; move it on the target side"
+        ),
+        side="clothing", notes=notes, handled=frozenset(attached),
+    ))
 
     # Translate clothing morph + mesh names to English — ALWAYS. Clothing names
     # have no external name binding to break (RigForge produces a real FBX, not
@@ -548,10 +831,15 @@ def _run_merge(
     #    id by a safe constant, using repoint to redirect bone references.
     stripped_doc = parse_fbx(stripped)
     stripped_view = extract(stripped_doc)
-    offset = _compute_safe_offset(target_avatar)
+    offset = _compute_safe_offset(target_view)
     notes.append(f"offset: shifting clothing ids by {offset}")
     offset_edits = id_offset_edits(stripped_view, offset=offset, repoint=repoint_table)
     offset_ascii = apply_edits(stripped, offset_edits)
+    if attached:
+        offset_ascii = _reparent_root_links(
+            offset_ascii,
+            {repoint_table.get(mid, mid + offset): bone for mid, bone in attached.items()},
+        )
 
     # 4. Splice pass: extract clothing's surviving Objects + Connections
     #    bodies, splice into target's same-named sections.
@@ -563,7 +851,9 @@ def _run_merge(
         f"connections_payload={len(connections_payload)}B"
     )
 
-    target_ascii = target_avatar.load_ascii_bytes()
+    # `target_ascii` (and `target_view`, extracted from the same bytes) arrive
+    # from run_phase_c: the curated avatar's file, or — chained compose — the
+    # previous garment's merged output.
     # Apply user's target-side drops BEFORE the splice. Two flavors:
     #   - target_drop_bone_ids: kept for power users / older callers
     #   - target_drop_mesh_ids: what the FE outliner sends — strip the
@@ -573,6 +863,7 @@ def _run_merge(
         or target_drop_mesh_ids
         or target_drop_blend_shape_channel_ids
         or target_blend_shape_channel_overrides
+        or target_bone_transforms
         or translate_target_morphs
     ):
         target_drop_edits: list[TextEdit] = []
@@ -599,8 +890,18 @@ def _run_merge(
                 continue
             target_drop_edits.extend(drop_blend_shape_channel_edits(target_view, cid))
         target_override_applied = 0
+        target_doomed_channel_ids: set[int] = set()
+        for _mid in target_drop_mesh_ids:
+            target_doomed_channel_ids |= mesh_blend_shape_channel_ids(target_view, _mid)
         for cid, pct in target_blend_shape_channel_overrides.items():
             if cid in target_drop_blend_shape_channel_ids:
+                continue
+            if cid in target_doomed_channel_ids:
+                ch = target_view.blend_shape_channels.get(cid)
+                notes.append(
+                    f"skip: override on channel {ch.name if ch else cid!r} "
+                    f"(id={cid}) — its target mesh is dropped"
+                )
                 continue
             channel_edits = set_blend_shape_channel_deform_percent_edits(
                 target_view, cid, pct,
@@ -608,6 +909,14 @@ def _run_merge(
             if channel_edits:
                 target_drop_edits.extend(channel_edits)
                 target_override_applied += 1
+        # Bone moves on the target side (e.g. nudge the base avatar's own hat
+        # bone). Dropped target bones/meshes are untouchable — drop wins.
+        target_drop_edits.extend(_bone_transform_edits(
+            target_view, target_bone_transforms,
+            untouchable=set(target_drop_bone_ids) | set(target_drop_mesh_ids),
+            untouchable_reason="that target bone/mesh is being dropped",
+            side="target", notes=notes,
+        ))
         # Translate the base avatar's own morph + mesh names — only when the FE
         # checkbox is on. Skip ids being dropped above so no edit overlaps.
         if translate_target_morphs:
@@ -638,6 +947,11 @@ def _run_merge(
     #    skin weight to any vertex. Leaf-prune iteratively so dead chains
     #    (e.g. `_end` markers, unused IK helpers) collapse end-first without
     #    orphaning weighted descendants. Re-parses the merged bytes once.
+    if not zero_weight_sweep:
+        notes.append(
+            "zero_weight_sweep: deferred (chained merge; the final garment sweeps)"
+        )
+        return merged
     merged_view = extract(parse_fbx(merged))
     zero_weight_ids = zero_weight_leaf_bone_ids(merged_view)
     if zero_weight_ids:
@@ -659,13 +973,14 @@ def _run_merge(
     return merged
 
 
-def _compute_safe_offset(target_avatar: CuratedAvatar) -> int:
+def _compute_safe_offset(target_view: SectionView) -> int:
     """Pick an id offset larger than any id present in the target ASCII.
 
-    Scans the target's Objects for max numeric id (cheap — we already cache
-    the SectionView at registry-load).
+    Scans the target's Objects for max numeric id. Takes the VIEW being
+    merged into (not the curated avatar) so a chained compose clears the
+    previous garment's already-offset ids too, not just the bare avatar's.
     """
-    view = target_avatar.load_ascii_view()
+    view = target_view
     candidates = [b.model_id for b in view.bones.values()]
     candidates.extend(view.clusters.keys())
     # Also scan ALL Objects (NodeAttributes, Geometries, Materials, Textures,

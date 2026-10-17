@@ -38,10 +38,12 @@ _API_URL = "https://api.anthropic.com/v1/messages"
 @dataclass(frozen=True)
 class AnthropicConfig:
     """Connection config. `api_key` is the bare secret; `model` is the
-    Anthropic model id (e.g. 'claude-opus-4-7'). Defaults chosen to match
-    the user's current setup."""
+    Anthropic model id (e.g. 'claude-sonnet-4-6'). Default is Sonnet —
+    the fast model — chosen as the drop-in fallback when the primary
+    (Ollama) provider is down. Pass an explicit `model` for a higher-quality
+    pass (e.g. 'claude-opus-4-8')."""
     api_key: str
-    model: str = "claude-opus-4-7"
+    model: str = "claude-sonnet-4-6"
     max_tokens: int = 32000
     timeout_seconds: float = 600.0
 

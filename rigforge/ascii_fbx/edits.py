@@ -21,10 +21,10 @@ sole writer of FBX bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import AbstractSet, Iterable, Optional
 
 from .lexer import FBXDocument, FBXNode
-from .sections import BoneRecord, ClusterRecord, SectionView, parse_args, _num
+from .sections import BoneRecord, ClusterRecord, SectionView, parse_args, _num, _str
 
 
 class EditError(RuntimeError):
@@ -147,6 +147,58 @@ def drop_cluster_edits(view: SectionView, cluster: ClusterRecord) -> list[TextEd
     return edits
 
 
+def mesh_geometry_ids(view: SectionView, mesh_model_id: int) -> set[int]:
+    """Geometry ids owned by a Mesh-type Model."""
+    return {
+        gid for gid, mid in view.geometry_owner_model.items()
+        if mid == mesh_model_id
+    }
+
+
+def mesh_skin_ids(view: SectionView, mesh_model_id: int) -> set[int]:
+    """Skin Deformer ids bound to a Mesh-type Model's geometries."""
+    geom_ids = mesh_geometry_ids(view, mesh_model_id)
+    return {
+        s.skin_id for s in view.skins.values()
+        if s.geometry_id is not None and s.geometry_id in geom_ids
+    }
+
+
+def mesh_cluster_ids(view: SectionView, mesh_model_id: int) -> set[int]:
+    """Cluster ids that skin a Mesh-type Model (Model -> Geometry -> Skin ->
+    Cluster).
+
+    Shared by `drop_mesh_edits` (which removes them) and by callers that must
+    avoid emitting edits INSIDE a Cluster block another pass is deleting — see
+    `rename_bone_edits(skip_cluster_ids=...)`.
+    """
+    skin_ids = mesh_skin_ids(view, mesh_model_id)
+    return {cid for cid, sid in view.cluster_skin.items() if sid in skin_ids}
+
+
+def mesh_blend_shape_channel_ids(view: SectionView, mesh_model_id: int) -> set[int]:
+    """BlendShapeChannel ids that `drop_mesh_edits` would cascade-delete for
+    this mesh (Model -> Geometry -> BlendShape deformer -> channels).
+
+    Callers that emit edits INSIDE a channel node (DeformPercent overrides,
+    channel renames) must skip these when the mesh is being dropped in the
+    same pass — otherwise the two edits overlap and `apply_edits` raises.
+    """
+    geom_ids = mesh_geometry_ids(view, mesh_model_id)
+    if not geom_ids:
+        return set()
+    bs_ids = {
+        s for s, d in iter_oo_connections(view)
+        if d in geom_ids and s in view.blend_shapes
+    }
+    if not bs_ids:
+        return set()
+    return {
+        s for s, d in iter_oo_connections(view)
+        if d in bs_ids and s in view.blend_shape_channels
+    }
+
+
 def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
     """Edits required to remove a whole mesh chain from the document:
        - the Mesh-type Model node
@@ -176,18 +228,9 @@ def drop_mesh_edits(view: SectionView, mesh_model_id: int) -> list[TextEdit]:
     source = view.document.source
     edits: list[TextEdit] = [drop_node_edit(bone.node_ref, source)]
 
-    geom_ids: set[int] = {
-        gid for gid, mid in view.geometry_owner_model.items()
-        if mid == mesh_model_id
-    }
-    skin_ids: set[int] = {
-        s.skin_id for s in view.skins.values()
-        if s.geometry_id is not None and s.geometry_id in geom_ids
-    }
-    cluster_ids: set[int] = {
-        cid for cid, sid in view.cluster_skin.items()
-        if sid in skin_ids
-    }
+    geom_ids = mesh_geometry_ids(view, mesh_model_id)
+    skin_ids = mesh_skin_ids(view, mesh_model_id)
+    cluster_ids = mesh_cluster_ids(view, mesh_model_id)
 
     # Cascade into the blendshape graph attached to the dropped Geometry.
     # FBX convention: src=BlendShape, dst=Geometry  (deformer attached to mesh).
@@ -312,6 +355,246 @@ def _format_percent_value(value: float) -> str:
     if value == int(value):
         return str(int(value))
     return f"{value:.6g}"
+
+
+# ---------------------------------------------------------------------------
+# Add a scaled copy of a blendshape channel
+# ---------------------------------------------------------------------------
+
+
+def _object_header_id(node: FBXNode, source: bytes) -> Optional[int]:
+    args = parse_args(node.args_bytes(source))
+    if args and args[0][0] == "num":
+        return int(args[0][1])
+    return None
+
+
+def _array_values(node: FBXNode, source: bytes) -> Optional[list]:
+    """The numbers of an `X: *N { a: ... }` child, or None if absent."""
+    a = node.child("a")
+    if a is None:
+        return None
+    return [_num(t) for t in parse_args(a.args_bytes(source)) if t[0] == "num"]
+
+
+def _fmt_num(v: float) -> str:
+    return str(int(v)) if v == int(v) else f"{v:.15g}"
+
+
+def add_scaled_blend_shape_channel_edits(
+    view: SectionView,
+    source_channel_id: int,
+    new_name: str,
+    factor: float,
+    *,
+    deform_percent: float = 0.0,
+) -> list[TextEdit]:
+    """Add a BlendShapeChannel `new_name` on the same BlendShape deformer as
+    `source_channel_id`, whose Shape is the source's: the same vertex
+    Indexes, its Vertices and Normals deltas times `factor`. At 100 it does
+    what the source would at `factor` x 100 — more of the author's own
+    motion, as a key of its own (GG_headset's 内 -> 内_neck, 2026-10-15).
+
+    The Shape and channel go in right after the source channel's node, their
+    two `C: "OO"` links at the end of Connections, with ids above every
+    Objects id. Raises EditError for an unknown source, a source without
+    exactly one Shape, or a name the deformer already has.
+    """
+    src_ch = view.blend_shape_channels.get(source_channel_id)
+    if src_ch is None:
+        raise EditError(f"no blendshape channel with id {source_channel_id}")
+    if src_ch.blend_shape_id is None:
+        raise EditError(f"channel {src_ch.name!r} is not linked to a BlendShape deformer")
+    if any(c.name == new_name and c.blend_shape_id == src_ch.blend_shape_id
+           for c in view.blend_shape_channels.values()):
+        raise EditError(f"the deformer of {src_ch.name!r} already has a channel {new_name!r}")
+
+    source = view.document.source
+    objects = view.document.root("Objects")
+    connections = view.document.root("Connections")
+    if objects is None or connections is None or connections.body_close is None:
+        raise EditError("document has no Objects / Connections section")
+    by_id = {}
+    for obj in objects.children:
+        oid = _object_header_id(obj, source)
+        if oid is not None:
+            by_id[oid] = obj
+    shapes = [s for s, d in iter_oo_connections(view)
+              if d == source_channel_id and s in by_id and by_id[s].name == "Geometry"]
+    if len(shapes) != 1:
+        raise EditError(f"channel {src_ch.name!r} has {len(shapes)} shapes, expected 1")
+    shape = by_id[shapes[0]]
+
+    arrays = {}
+    for child in shape.children:
+        if child.name in ("Indexes", "Vertices", "Normals"):
+            arrays[child.name] = _array_values(child, source)
+    if arrays.get("Indexes") is None or arrays.get("Vertices") is None:
+        raise EditError(f"shape of {src_ch.name!r} has no Indexes / Vertices")
+
+    new_shape_id = max(by_id) + 1
+    new_ch_id = max(by_id) + 2
+    line_start = source.rfind(b"\n", 0, shape.name_span[0]) + 1
+    ind = source[line_start:shape.name_span[0]].decode("ascii")
+
+    def block(name: str, values, *, ints: bool = False) -> str:
+        nums = ",".join(str(int(v)) if ints else _fmt_num(v * factor) for v in values)
+        return (f"{ind}\t{name}: *{len(values)} {{\n{ind}\t\ta: {nums}\n{ind}\t}} \n")
+
+    text = (
+        f'{ind}Geometry: {new_shape_id}, "Geometry::{new_name}", "Shape" {{\n'
+        f"{ind}\tVersion: 100\n"
+        + block("Indexes", arrays["Indexes"], ints=True)
+        + block("Vertices", arrays["Vertices"])
+        + (block("Normals", arrays["Normals"]) if arrays.get("Normals") is not None else "")
+        + f"{ind}}}\n"
+        f'{ind}Deformer: {new_ch_id}, "SubDeformer::{new_name}", "BlendShapeChannel" {{\n'
+        f"{ind}\tVersion: 100\n"
+        f"{ind}\tDeformPercent: {_format_percent_value(deform_percent)}\n"
+        f"{ind}\tFullWeights: *1 {{\n{ind}\t\ta: 100\n{ind}\t}} \n"
+        f"{ind}}}\n"
+    )
+    if src_ch.node_ref.body_close is None:
+        raise EditError(f"channel {src_ch.name!r} node has no body")
+    after_channel = source.find(b"\n", src_ch.node_ref.body_close)
+    after_channel = len(source) if after_channel == -1 else after_channel + 1
+
+    close_line = source.rfind(b"\n", 0, connections.body_close) + 1
+    conn_ind = "\t"
+    for c in connections.children:
+        if c.name == "C":
+            ls = source.rfind(b"\n", 0, c.name_span[0]) + 1
+            conn_ind = source[ls:c.name_span[0]].decode("ascii")
+            break
+    links = (f'{conn_ind}C: "OO",{new_shape_id},{new_ch_id}\n'
+             f'{conn_ind}C: "OO",{new_ch_id},{src_ch.blend_shape_id}\n')
+    return [
+        TextEdit(after_channel, after_channel, text.encode("utf-8")),
+        TextEdit(close_line, close_line, links.encode("ascii")),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Bone move: rest-pose local transform of a Model node
+# ---------------------------------------------------------------------------
+
+_LCL_PROPERTY_NAMES = ("Lcl Translation", "Lcl Rotation", "Lcl Scaling")
+
+
+def set_model_local_transform_edits(
+    view: SectionView,
+    model_id: int,
+    *,
+    translation: Optional[tuple[float, float, float]] = None,
+    rotation_deg: Optional[tuple[float, float, float]] = None,
+    scale: Optional[tuple[float, float, float]] = None,
+) -> list[TextEdit]:
+    """Edits that set a Model's rest-pose local transform (FBX frame).
+
+    Rewrites the numeric values of `Lcl Translation` / `Lcl Rotation` /
+    `Lcl Scaling` in the Model's Properties70 block; a property the exporter
+    elided (bones at the default rotation/scale routinely have no line) is
+    INSERTED with the same indentation as its siblings. Components passed as
+    None are left alone.
+
+    Why this moves the mesh: the skin clusters' bind pose (`TransformLink`)
+    is deliberately untouched, so every vertex weighted to the bone is
+    evaluated against the old bind and the new rest transform — the mesh
+    follows the bone rigidly. Identical to dragging the bone in Unity.
+
+    Returns [] for an unknown id or when nothing is requested. Raises
+    EditError when the Model has no Properties70 block or a property line
+    is malformed (fewer than three numbers) — those are file problems the
+    caller should surface, not silently skip.
+    """
+    bone = view.bones.get(model_id)
+    if bone is None:
+        return []
+    wanted: list[tuple[str, tuple[float, float, float]]] = [
+        (name, vec) for name, vec in zip(
+            _LCL_PROPERTY_NAMES, (translation, rotation_deg, scale),
+        ) if vec is not None
+    ]
+    if not wanted:
+        return []
+
+    source = view.document.source
+    props = bone.node_ref.child("Properties70")
+    if props is None:
+        raise EditError(
+            f"Model {model_id} ({bone.name!r}) has no Properties70 block; "
+            f"cannot set its local transform"
+        )
+    p_children = props.child_all("P")
+    existing: dict[str, FBXNode] = {}
+    for p in p_children:
+        args = parse_args(p.args_bytes(source))
+        name = _str(args[0]) if args else None
+        if name in _LCL_PROPERTY_NAMES and name not in existing:
+            existing[name] = p
+
+    from .merge import positioned_args
+
+    edits: list[TextEdit] = []
+    inserts: list[bytes] = []
+    insert_at, indent = _properties70_insert_point(props, p_children, source)
+    for prop_name, vec in wanted:
+        formatted = _format_vec3(vec)
+        p = existing.get(prop_name)
+        if p is None:
+            inserts.append(
+                indent + f'P: "{prop_name}", "{prop_name}", "", "A",'.encode("ascii")
+                + formatted + b"\n"
+            )
+            continue
+        args_start, args_end = p.args_span
+        nums = [t for t in positioned_args(source[args_start:args_end]) if t.kind == "num"]
+        if len(nums) < 3:
+            raise EditError(
+                f"Model {model_id} ({bone.name!r}): {prop_name} has "
+                f"{len(nums)} numeric values, expected 3"
+            )
+        first, last = nums[-3], nums[-1]
+        edits.append(TextEdit(args_start + first.start, args_start + last.end, formatted))
+    if inserts:
+        edits.append(TextEdit(insert_at, insert_at, b"".join(inserts)))
+    return edits
+
+
+def _properties70_insert_point(
+    props: FBXNode, p_children: list[FBXNode], source: bytes,
+) -> tuple[int, bytes]:
+    """Where a new `P:` line goes inside a Properties70 block, and the
+    indentation to give it: right after the last existing `P:` line (copying
+    its indent), or, for an empty block, on the line after `{` one tab deeper
+    than the closing brace."""
+    if p_children:
+        last = p_children[-1]
+        line_start = source.rfind(b"\n", 0, last.name_span[0]) + 1
+        indent = source[line_start:last.name_span[0]]
+        # A leaf's extent_end swallows trailing whitespace (up to the next
+        # token), so anchor on the first newline after its args instead.
+        nl = source.find(b"\n", last.intro_end)
+        if nl == -1:
+            raise EditError("Properties70 block is not newline-terminated")
+        return nl + 1, indent
+    assert props.body_open is not None and props.body_close is not None
+    close_line_start = source.rfind(b"\n", 0, props.body_close) + 1
+    indent = source[close_line_start:props.body_close] + b"\t"
+    nl = source.find(b"\n", props.body_open)
+    if nl == -1 or nl > props.body_close:
+        raise EditError("Properties70 block is not newline-terminated")
+    return nl + 1, indent
+
+
+def _format_vec3(vec: tuple[float, float, float]) -> bytes:
+    """`x,y,z` the way the FBX SDK writes them: bare ints when whole,
+    shortest round-trip repr otherwise (so 0.0787041112780571 survives)."""
+    parts = []
+    for v in vec:
+        f = float(v)
+        parts.append(str(int(f)) if f.is_integer() else repr(f))
+    return ",".join(parts).encode("ascii")
 
 
 def drop_blend_shape_channel_edits(
@@ -489,12 +772,22 @@ def rename_bone_edits(
     view: SectionView,
     bone: BoneRecord,
     new_short_name: str,
+    *,
+    skip_cluster_ids: Optional[AbstractSet[int]] = None,
 ) -> list[TextEdit]:
     """Edits to change the bone's display name from `bone.name` to
     `new_short_name`, touching:
        - the Model's quoted name `"Model::<old>"`
        - every attached Cluster's `"SubDeformer::<old>"` (if it matches)
+
+    `skip_cluster_ids` suppresses the cluster-side rename for clusters another
+    pass is removing wholesale. A mesh drop deletes entire Cluster blocks, and
+    a bone that skins that mesh would otherwise queue a name rewrite INSIDE a
+    deleted range — which `apply_edits` rejects as an overlap. The deletion
+    wins; the rename there is moot. Callers that drop meshes pass those meshes'
+    `mesh_cluster_ids`.
     """
+    skip_cluster_ids = skip_cluster_ids or frozenset()
     source = view.document.source
     edits: list[TextEdit] = []
 
@@ -505,6 +798,8 @@ def rename_bone_edits(
     ))
 
     for cid in bone.cluster_ids:
+        if cid in skip_cluster_ids:
+            continue
         cluster = view.clusters.get(cid)
         if cluster is None:
             continue

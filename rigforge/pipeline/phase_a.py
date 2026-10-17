@@ -29,6 +29,10 @@ class PhaseAResult:
     candidates: list[tuple[str, float]]
     ascii_path: Path                # cached intermediate (caller may reuse)
     view: SectionView
+    # A garment with no bones (a rigid prop: mesh + blendshapes only). It has
+    # nothing to match a donor on, so the target stands in as its donor and
+    # Phase B has nothing to classify; Phase C merges its meshes as-is.
+    rigid: bool = False
 
 
 def run_phase_a(
@@ -69,6 +73,17 @@ def run_phase_a(
 
     doc = parse(ascii_path.read_bytes())
     view = extract(doc)
+    if view.is_rigid():
+        if target_id is None:
+            raise DonorIdentificationError(
+                f"{clothing_fbx.name} has no bones (a rigid mesh): name the target "
+                f"avatar to merge it onto",
+                [],
+            )
+        return PhaseAResult(
+            donor_id=target_id, score=0.0, candidates=[],
+            ascii_path=ascii_path, view=view, rigid=True,
+        )
     bone_names = [b.name for b in view.limb_bones() if b.name]
 
     donor_id, score, ranked = identify_donor(

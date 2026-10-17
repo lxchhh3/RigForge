@@ -112,12 +112,52 @@ def test_required_roles_pass(schema):
 
 
 def test_required_roles_missing_hips(schema):
-    """Drop Hips from the assignment → must flag missing required role."""
+    """No bone assigned Hips at all → flagged, but only as a WARNING: a
+    partial garment may legitimately lack a required role (the two tests
+    below pin the error/warning split)."""
     needed = [r for r in schema.required_roles if r != "Hips"]
     decisions = _ds(*[_kept(i, r) for i, r in enumerate(needed)])
     view = StubView(bones={})
     violations = rule_required_roles_present(decisions, view, schema)
-    assert any("Hips" in v.message for v in violations)
+    hips = [v for v in violations if "Hips" in v.message]
+    assert len(hips) == 1
+    assert hips[0].severity == "warning"
+    assert hips[0].rule == "required_roles_present"
+    assert errors(violations) == []
+
+
+def test_required_roles_absent_in_partial_garment_warn_not_error(schema):
+    """A legs-only garment (real case: Maya_Stocking.fbx — Hips/Spine/Chest +
+    both leg chains, nothing above the chest) has NO bone that could hold
+    Head or UpperArm.*. That is not an LLM failure — there is nothing to
+    merge for those roles — so the rule must not block the run. One warning
+    per absent role, naming it, so the manifest records the partial merge."""
+    present = ["Hips", "Spine", "Chest", "UpperLeg.L", "UpperLeg.R"]
+    decisions = _ds(*[_kept(i, r) for i, r in enumerate(present)])
+    view = StubView(bones={i: StubBone(i, r, None) for i, r in enumerate(present)})
+    violations = rule_required_roles_present(decisions, view, schema)
+    assert errors(violations) == []
+    absent = {"Head", "UpperArm.L", "UpperArm.R"}
+    assert {v.message.split("'")[1] for v in warnings(violations)} == absent
+    assert all(v.rule == "required_roles_present" for v in violations)
+
+
+def test_required_roles_assigned_but_all_dropped_is_error(schema):
+    """The LLM DID find the Head bone but dropped it → still a hard error: a
+    load-bearing canonical bone must be kept (repointed onto the target),
+    never dropped. The violation carries the offending bone id."""
+    others = [r for r in schema.required_roles if r != "Head"]
+    decisions = _ds(
+        *[_kept(i, r) for i, r in enumerate(others)],
+        Decision(model_id=99, role="Head", verdict="drop", drop_category="aux"),
+    )
+    view = StubView(bones={99: StubBone(99, "head", None)})
+    violations = rule_required_roles_present(decisions, view, schema)
+    errs = errors(violations)
+    assert len(errs) == 1
+    assert "Head" in errs[0].message
+    assert errs[0].bone_ids == [99]
+    assert warnings(violations) == []
 
 
 # --- rule_l_r_pairing -------------------------------------------------------

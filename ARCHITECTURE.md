@@ -8,10 +8,14 @@ Two Python envs, both required:
 
 | Env | Purpose | Python | Lives at |
 |---|---|---|---|
-| RigForge project env | Everything except FBX SDK calls | 3.10+ | active env when running `rigforge` |
+| RigForge project env | Everything except FBX SDK / Blender calls | 3.10+ | active env when running `rigforge` |
 | `fbx_env` (conda) | Binary↔ASCII FBX conversion via Autodesk FBX SDK 2020.3.9 | 3.10 | `D:/2files/env_build/conda/conda/envs/fbx_env/` |
+| Blender 4.3.0 (optional) | Headless geometry pre-step (`taste-edit`) — `bpy` as a library | bundled | `$RIGFORGE_BLENDER_EXE` (default `D:/2files/tools/blender-4.3.0-windows-x64/`) |
 
-`rigforge.ascii_fbx.convert` shells out to `fbx_env` over subprocess; the SDK is never imported into the main env.
+`rigforge.ascii_fbx.convert` shells out to `fbx_env` over subprocess; the SDK is
+never imported into the main env. `rigforge.geometry.blender_edit` shells out to
+Blender the same way (`blender --background --python blender_env/geometry_edit.py`);
+Blender is only needed for the optional taste-edit pre-step.
 
 Toolchain scripts (third-party, not in this repo): `D:/2files/models/vrc/Maya/Maya_Ver1.02.2/{fbx_bin2ascii,fbx_ascii2bin,fbx_compare}.py`.
 
@@ -75,13 +79,16 @@ rigforge/
 │   ├── sections.py   3-pass extract → Models + Geometries + Skins + Clusters
 │   │                 + materials/blendshapes + cluster_skin/geometry_owner_model
 │   │                 indexes + bone_to_mesh_names() affinity helper
-│   └── edits.py      TextEdit primitives:
-│                       drop_bone_edits, rename_bone_edits, reparent_bone_edits,
-│                       drop_cluster_edits, drop_mesh_edits,
-│                       drop_blend_shape_channel_edits,
-│                       set_blend_shape_channel_deform_percent_edits,
-│                       rename_blend_shape_channel_edits, rename_mesh_edits,
-│                       rename_geometry_edits (all v2)
+│   ├── edits.py      TextEdit primitives:
+│   │                   drop_bone_edits, rename_bone_edits, reparent_bone_edits,
+│   │                   drop_cluster_edits, drop_mesh_edits,
+│   │                   drop_blend_shape_channel_edits,
+│   │                   set_blend_shape_channel_deform_percent_edits,
+│   │                   rename_blend_shape_channel_edits, rename_mesh_edits,
+│   │                   rename_geometry_edits (all v2),
+│   │                   set_model_local_transform_edits (bone move, v3)
+│   └── transform.py  Unity <-> FBX local-transform math for bone moves
+│                     (X-mirror + Euler ZXY <-> XYZ via matrices), LocalTransform
 ├── naming.py        dictionary JP/KR→EN name translation (no LLM):
 │                     load_translation_table() + translate_name() — exact match,
 │                     then peel laterality (_L/_R/右/左) + index tails (incl.
@@ -141,7 +148,7 @@ rigforge/
 | GET    | `/api/avatars`                    | List curated avatars + their canonical roles |
 | GET    | `/api/avatars/{id}/inspect`       | Parse a curated avatar's ASCII FBX; return bone records (typed: LimbNode / Mesh / Null) for the FE outliner |
 | POST   | `/api/clothings/inspect`          | Same shape as avatar inspect, but for a clothing path. Auto-converts binary FBX through `fbx_env` and caches the ASCII under `data/_inspect_cache/` |
-| POST   | `/api/assemble`                   | Run the full pipeline with optional user pre-filters: `drop_bone_ids` / `target_drop_bone_ids` (advanced) and `drop_mesh_ids` / `target_drop_mesh_ids` (what the FE sends) |
+| POST   | `/api/assemble`                   | Run the full pipeline. ONE garment via `clothing_path` + flat pre-filters (`drop_mesh_ids`, `drop_bone_ids`, channel drops/overrides, bone moves), or SEVERAL via `clothings: [{clothing_path, drop_mesh_ids, ...}, ...]` — each with its own selections — merged in order into ONE output (`<stemA>+<stemB>__<target>.fbx`). Target-side pre-filters (`target_drop_mesh_ids`, ...) stay top-level and apply once |
 | GET    | `/api/assemblies`                 | List recent manifests in `data_dir` |
 | GET    | `/api/assemblies/{id}`            | Fetch one manifest by stem |
 
@@ -162,13 +169,84 @@ Compose.vue
 │   └── ClothingItem per added clothing
 │       └── MeshList: same outliner shape; unchecking strips that mesh from the clothing.
 └── Assemble button ───► POST /api/assemble
-    └── Sends drop_mesh_ids (per clothing) + target_drop_mesh_ids (shared across batch).
-        Pipeline returns the merged binary FBX path + manifest.
+    └── ONE request: clothings=[{clothing_path, drop_mesh_ids, ...} per clothing] +
+        target_drop_mesh_ids (shared). Pipeline merges every garment into ONE binary FBX
+        (garment 1 onto the target, garment 2 onto that result, ...) and returns its path +
+        one manifest with a per-garment `clothings[]` section. Never one file per garment.
 ```
 
 The modder never sees bones. Bone-level drops still exist in the API for power use, but the UI surfaces only mesh model_ids — Maya's rigging convention puts every bone in every mesh's skin, so a bone-level UI lies about what a checkbox actually does. Mesh ids are the honest unit.
 
 `drop_mesh_edits` (in `ascii_fbx/edits.py`) removes a mesh as one consistent chain: Mesh-Model + Geometry + Skin + every Cluster of that Skin + all referencing connections. Bones are left in place (they're shared across meshes; cascading bone cleanup would corrupt siblings).
+
+## Geometry pre-step — `taste-edit` (v3)
+
+An *optional*, *standalone* pre-step that edits a clothing's geometry before it
+enters `assemble` — the same slot MochiFitter occupies. It is **never** part of
+the assemble pipeline; it produces a new clothing FBX whose path you then feed
+to `assemble`.
+
+- **`rigforge/geometry/`** — `blender_edit.py` shells out to headless Blender
+  (mirroring `ascii_fbx/convert.py`); `report.py` holds the pure preservation
+  checks. `blender_env/geometry_edit.py` + `slice_select.py` run inside Blender.
+- **Ops** (all driven from one mesh, one axis): `bisect_cut` (a real cut —
+  removes height with no texture compression; the production op), `scale_slice`
+  (squash a band — compresses texture), `translate_slice` (rigid band move).
+- **Why Blender, not the FBX SDK:** Blender's `bisect`/bmesh gives a real cut
+  and *interpolates skin weights onto the new cut edge*, so the rig survives.
+  Blender re-serializes the whole FBX (binary only, and it bakes a -90 mesh
+  rotation), so it must run on the clothing **in isolation** — never on a merged
+  output. RigForge re-parses the clothing from scratch anyway, so this is safe.
+- **Safety:** `scale`/`translate` are vertex-count-preserving. `bisect_cut`
+  changes the count (so it loses the "rig byte-identical" guarantee) but the
+  report's `unweighted_verts_after` gates it — a cut that strips weights fails.
+- **Surfaces:** `rigforge taste-edit` (CLI, with `--list-meshes` to find the
+  sole) and `POST /api/clothings/taste-edit` (FE: per-clothing "Cut sole height"
+  panel with a before/after preview render).
+
+## Bone moves — rest-pose transform edits (v3)
+
+Set a bone's position / rotation / scale in its parent's frame, baked into the
+assembled FBX. **Not** a Blender op: it is one Rail-D property edit per bone
+(`Lcl Translation` / `Lcl Rotation` / `Lcl Scaling` on the Model node). The
+skin clusters' bind pose (`TransformLink`) is deliberately untouched, so every
+vertex weighted to the bone is evaluated against the old bind and the new rest
+transform — the mesh follows the bone rigidly. That is exactly what dragging a
+bone in Unity's editor does; Blender shows the same result (as the bone's pose
+over a bind-pose rest). Motivating case: a hat riding on its own `Hat.Root`
+bone that sits wrong on the target's head.
+
+- **Numbers are Unity's.** The FE/CLI take the values Unity's Inspector shows
+  for the bone (position m, rotation Euler °, scale). Unity imports FBX by
+  mirroring X, so `ascii_fbx/transform.py` converts: position `(-x, y, z)`,
+  rotation `M·R·M` through a matrix (Unity ZXY ↔ FBX XYZ Euler — composite
+  rotations convert exactly), scale unchanged. `frame: "fbx"` bypasses this.
+  Inspect returns `local_transform_unity` per bone so the FE prefills; its
+  rotation is the triple the Inspector SHOWS, not `localEulerAngles` (of the
+  two equivalent ZXY triples, the one closest to 0,0,0; at X = ±90 Y stays 0),
+  so a Blender-exported mesh opens as (-90, 0, 0), not (-90, -180, -180), and
+  an X-only edit tilts it the way Unity would. Pinned against 30 Unity
+  2022.3 imports in `tests/test_transform.py`.
+- **Where it applies.** `pipeline/bone_transforms.py` resolves each request
+  (`BoneTransformEdit`: id or unique name + partial `LocalTransform` + frame)
+  against the clothing or target view; Phase C applies clothing-side moves in
+  the strip pass and target-side moves in the target pre-splice pass. Bones the
+  merge replaces with the target's copy (`kept_bone_ids`), dropped bones, and
+  dropped meshes are skipped with a `skip: bone_transform …` note — in the
+  donor==target case that is *every* name-matched clothing bone, so a canonical
+  bone is moved on the target side. An ambiguous name is a hard error (never
+  guess which duplicate). A missing `Lcl Rotation`/`Lcl Scaling` line is
+  inserted (the SDK elides defaults).
+- **Surfaces:** `rigforge assemble --bone-transform "NAME;pos=x,y,z;rot=x,y,z;scale=x,y,z"`
+  (repeatable; `#<id>` for an id; `--target-bone-transform`;
+  `--bone-transform-frame unity|fbx`), `AssembleRequest.bone_transforms` /
+  `target_bone_transforms`, and the FE "Move bones" panel on each clothing and
+  on the target (`BoneTransformPanel.vue`: bone picker, prefilled xyz rows,
+  Apply sends only the rows that differ from the file). Moves persist with the
+  other selections and are written into the manifest (`input.bone_transforms`).
+- **Proof:** `training/smoke_bone_transform.py` raises Maya's own `Hat Root`
+  by 5 cm, re-reads the bone in headless Blender (`blender_env/bone_report.py`:
+  posed head moves by the offset, rest head does not) and renders before/after.
 
 ## Key invariants
 
@@ -195,7 +273,7 @@ Config resolution order: explicit `path` arg → `RIGFORGE_OLLAMA_CONFIG` env va
 | # | Rule | Severity |
 |---|---|---|
 | 1 | unique_role | error |
-| 2 | required_roles_present | error |
+| 2 | required_roles_present | error if a bone was assigned the role but every one was dropped; warning if no bone holds it at all (partial garment, e.g. legs-only stockings have no Head/UpperArm) |
 | 3 | l_r_pairing | error |
 | 4 | monotonic_spine_y | error |
 | 5 | hierarchy_consistency | error (subsequence match + required ancestors) |
@@ -211,7 +289,7 @@ Error → one re-prompt with violation text appended → second failure raises.
 | `tests/test_*.py` | pytest — 394 tests (~13m for the full sweep; the cost is fbx_env bin↔ASCII conversion of the 40MB Maya, not the LLM, which is mocked — most files run in seconds). HTTP mocked, FBX via fixtures. Covers lexer, sections + affinity, edits (incl. drop_mesh + drop/rename blend_shape_channel + rename_mesh/geometry + set_blend_shape_channel_deform_percent), dictionary name translation (`test_naming`, `test_morph_mesh_translation`), validators, cache, merge primitives, Phase A/B/C (incl. cross-merge materials/blendshapes dedup, channel drops, DeformPercent overrides, morph/mesh translation), the API endpoints, the LLM client + streaming NDJSON, and end-to-end on real Maya.fbx. |
 | `tests/test_e2e.py` | Full pipeline against `MockLLMClient`: a PARTIAL synth clothing (one garment mesh, renamed distinct) merged onto maya, then a binary→ASCII round-trip asserts the merge (garment added distinctly, target meshes survive, skeleton repointed not doubled). Reworked from the old byte-identity-to-Maya.fbx check, which the always-merge pivot made obsolete. |
 | `tests/test_api.py` | TestClient against the FastAPI app: avatar/clothing inspect, assemble endpoint, mesh + bone drop forwarding, translate_target_morphs flag. |
-| `frontend/tests/e2e/*.spec.ts` | Playwright — 18 specs covering compose flow (avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-channel drop UX, blendshape DeformPercent slider, target morph-translation checkbox, live progress + error events, history view). Auto-starts the dev server and mocks the API. |
+| `frontend/tests/e2e/*.spec.ts` | Playwright — 31 specs covering compose flow (avatar pick, clothing inspect, mesh-drop UX, target strip, blendshape-channel drop UX, blendshape DeformPercent slider + typed two-decimal field, target morph-translation checkbox, live progress + error events, history view). Auto-starts the dev server and mocks the API. |
 | `training/smoke_ollama.py` | Manual. Real Ollama, LLM-only (no Phase C). Spits keep/drop summary + validator output. |
 | `training/smoke_full_pipeline.py` | Manual. Real Ollama, full assemble(), fbx_compare vs Maya.fbx (synth-clothing fixture). |
 | `training/smoke_cross_merge_mock.py` | Manual. Mock LLM, exercises Phase C pass-through on a real clothing (ClassicChic_Moe → Moe). Should round-trip structurally identical. |
@@ -240,9 +318,11 @@ Error → one re-prompt with violation text appended → second failure raises.
 - **Compose UI** — `frontend/` Vue 3 / Pinia / Vue Router / Playwright. Modder picks an avatar, adds clothing FBX paths, unchecks meshes in a Blender-outliner-style list (armature header + parallel mesh checkboxes), assembles. Bones are never surfaced.
 - **Mesh-level user pre-filter** — `drop_mesh_edits` primitive cleanly strips Mesh-Model + Geometry + Skin + Clusters as one unit. Endpoint accepts `drop_mesh_ids` + `target_drop_mesh_ids`; Phase C applies them in both pass-through and cross-merge.
 - **Blendshape-channel user pre-filter** — `drop_blend_shape_channel_edits` primitive strips a BlendShapeChannel SubDeformer + connections referencing it (owning BlendShape Deformer preserved — may hold surviving siblings). Inspect surfaces `blend_shape_channels[]`; assemble accepts `drop_blend_shape_channel_ids` + `target_drop_blend_shape_channel_ids`; FE renders a flat per-channel checkbox list with a name filter (channels number in the hundreds on real avatars).
-- **DeformPercent override (blendshape slider)** — `set_blend_shape_channel_deform_percent_edits` primitive rewrites just the numeric `DeformPercent` token on a BlendShapeChannel (matches Maya's int-vs-%g formatting so diffs stay clean). Inspect returns each channel's on-disk `deform_percent` so the FE slider opens at the file's actual baseline. Assemble accepts `blend_shape_channel_overrides` + `target_blend_shape_channel_overrides` (list of `{channel_id, deform_percent}`). Channels in the corresponding drop set are silently skipped — drop wins. FE: 0-100 range slider beside each channel checkbox; snapping back to the on-disk value clears the override (keeps payloads clean); current value highlights yellow when overridden.
+- **DeformPercent override (blendshape slider)** — `set_blend_shape_channel_deform_percent_edits` primitive rewrites just the numeric `DeformPercent` token on a BlendShapeChannel (matches Maya's int-vs-%g formatting so diffs stay clean). Inspect returns each channel's on-disk `deform_percent` so the FE slider opens at the file's actual baseline. Assemble accepts `blend_shape_channel_overrides` + `target_blend_shape_channel_overrides` (list of `{channel_id, deform_percent}`). Channels in the corresponding drop set are silently skipped — drop wins. FE: 0-100 range slider plus a typed number field beside each channel checkbox, both at two-decimal precision (values are clamped to 0-100 and rounded to 0.01; slider and field stay in sync); snapping back to the on-disk value clears the override (keeps payloads clean); current value highlights yellow when overridden.
 - **JP/KR→EN name translation** — makes non-English Booth assets readable. Two halves: (1) **bones** — the LLM emits a per-bone `name_en` (schema **v2.2**); `EditPlan` renames ride-along non-canonical bones to it. (2) **morphs + meshes** — `rigforge/naming.py` does a deterministic, offline dictionary lookup (`data/name_translation.json`, no LLM) for blendshape-channel, mesh (Model), and mesh-DATA (Geometry) names; `phase_c._translate_morph_and_mesh_edits` applies the renames via `rename_blend_shape_channel_edits` / `rename_mesh_edits` / `rename_geometry_edits`. `translate_name` peels laterality (`_L`/`_R`/`右`/`左`) + index tails (incl. full-width digits) and a bare trailing `L`/`R`, with an NFKC fallback for half-width katakana. Collisions are allowed (a smile spanning mouth+eyes+cheeks can legitimately share a name — no forced uniqueness). Safe because FBX wires by object id, not name. Clothing always translates; the target (base avatar) is behind `translate_target_morphs` (FE checkbox in `TargetPanel.vue`, default on) for the rare downstream-Unity-binds-by-name case. Coverage on Maya's morph set: 142/147; the rest are symbol/Greek mouth visemes left for human labels.
-- **Live assemble progress** — `assemble()` in `pipeline/orchestrator.py` takes an optional `progress_cb(phase, note)` invoked at phase boundaries. New `POST /api/assemble/stream` runs the pipeline on a worker thread and emits NDJSON events (`started` / `progress` / `heartbeat` / `done` / `error`) for the FE to read line-by-line. FE's `AssembleProgressList.vue` shows a 4-phase bar + most recent note per clothing in flight. Sync `POST /api/assemble` kept for CLI/scripted callers.
+- **Live assemble progress** — `assemble()` in `pipeline/orchestrator.py` takes an optional `progress_cb(phase, note)` invoked at phase boundaries. New `POST /api/assemble/stream` runs the pipeline on a worker thread and emits NDJSON events (`started` / `progress` / `heartbeat` / `done` / `error`) for the FE to read line-by-line. A multi-garment compose additionally emits `clothing` events (`index`, `stem`, `path`) as the orchestrator moves from one garment to the next and stamps every progress event with `clothing_index`, so FE's `AssembleProgressList.vue` drives one 4-phase row per garment from the single stream (queued → running → merged/done). Sync `POST /api/assemble` kept for CLI/scripted callers.
+- **Multi-garment compose = ONE file** — `assemble(clothings=[ClothingSpec, ...])` runs Phase A/B per garment and ONE Phase C chain: `run_phase_c(target_ascii=<previous merge>)` merges each garment onto the running result instead of the bare avatar (`_compute_safe_offset` clears the intermediate's ids, the zero-weight sweep is deferred to the last merge, target-side edits apply only in the first), then converts once. `PipelineRun.clothing_runs` + the manifest's `clothings[]` record every garment; top-level scalars mirror the first for older readers. CLI: repeat `--clothing`. Added 2026-09-20 after a Marette outfit + a stocking came out as two files.
+- **Rigid garments (no bones)** — a garment with Mesh Models but no LimbNode (a prop such as GG_headset: one mesh + blendshapes) has nothing for Phase A to fingerprint and used to fail the whole compose at score 0.000. `run_phase_a` now returns `rigid=True` with the target as donor (needs a target id); the orchestrator skips Phase B (no LLM call, empty `EditPlan`) and Phase C hangs its top-level meshes from the target's Armature (as in Unity, where kevin's GG.unity has the headset under Maya's Armature), world placement kept, still applying its blendshape overrides and move (a Mesh Model is movable). The move reads in the **Armature frame** (`rigid_move_frame`): the numbers Unity's Inspector shows for a prop under the avatar's Armature. The scene-root frame is used only when the target has no armature Null. Under the Armature it follows no bone, so a garment can name `attach_to_bone_id` (a TARGET bone id; FE: the "attach to bone" picker the inspect payload's `rigid` flag turns on): Phase C re-expresses its top-level meshes in that bone's rest frame (`model_world_matrix` + `affine_inverse` + `affine_to_fbx_local`, world placement kept — like dragging it onto the bone in Unity's Hierarchy; the Armature-frame move is folded in first) and rewrites the `C: "OO",<mesh>,0` link to the bone (or Armature) after the id-offset pass. `/api/clothings/inspect` takes the compose's `target_id` so a rigid mesh's `local_transform_unity` (the Move panel's prefill) is its placement in that Armature frame (`rigid_frame` names it); the FE re-inspects rigid garments when the target changes. Fixed 2026-10-15: the 21:56 run read kevin's Armature-local numbers (0, -0.085, 1.07) / (-81.4, 0, 0) in the Y-up root frame and put the headset 8.5 cm under the floor, 1.07 m in front of her. Chains with pivots / pre-rotation are refused, not approximated. Added 2026-10-14 for kevin's GG scene (outfit + headset hung from Maya's Neck; Unity: 0 mm from his scene, follows a turned Neck exactly).
 - **Bone affinity helper** — `bone_to_mesh_names(view, bone_id)` walks the bone subtree (chain-root case) and the cluster→skin→geometry→model chain, filtering out the zero-weight clusters that Maya's rigging convention inserts. The inspect endpoint returns this per bone so power-user tooling has the right `bone → meshes` map.
 - **`user_drop_bone_ids` pre-filter in Phase B** — forces verdict=drop on user-checked bones and cascades to their subtree; the drop_safety validator skips `drop_category="user_dropped"` so high-weight user drops don't error.
 
@@ -252,7 +332,7 @@ Error → one re-prompt with violation text appended → second failure raises.
 
 ### Out of scope — explicitly not problems v2 solves
 
-- **Mesh shape fitting.** Clothing is assumed pre-fit to the target avatar's proportions before it hits RigForge. The tool never touches vertex positions.
+- **Mesh shape fitting.** Clothing is assumed pre-fit to the target avatar's proportions before it hits RigForge. The core pipeline never touches vertex positions. (v3 adds an *optional* `taste-edit` pre-step — see below — for vertex-count-safe tweaks like cutting sole height; that is geometry *editing*, not *fitting*, and is never part of `assemble`.)
 - **Non-T-pose input.** Asset pipeline guarantees T-pose.
 - **Non-curated donor rigs / wrong-target mismatch.** Phase A hard-fails below threshold; no LLM recovery path for unknown donor families.
 
