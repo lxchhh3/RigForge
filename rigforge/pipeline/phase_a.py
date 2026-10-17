@@ -14,6 +14,7 @@ from typing import Optional
 from rigforge.ascii_fbx.convert import bin_to_ascii_cached
 from rigforge.ascii_fbx.lexer import parse
 from rigforge.ascii_fbx.sections import SectionView, extract
+from rigforge.avatars.fingerprint import strip_rig_suffix
 from rigforge.avatars.registry import (
     AvatarRegistry,
     DEFAULT_DONOR_THRESHOLD,
@@ -84,7 +85,8 @@ def run_phase_a(
             donor_id=target_id, score=0.0, candidates=[],
             ascii_path=ascii_path, view=view, rigid=True,
         )
-    bone_names = [b.name for b in view.limb_bones() if b.name]
+    # Match on base names: a MochiFitter export's `Hips_MFBase` is maya's `Hips`.
+    bone_names = [strip_rig_suffix(b.name) for b in view.limb_bones() if b.name]
 
     donor_id, score, ranked = identify_donor(
         bone_names, registry, target_id=target_id, threshold=threshold,

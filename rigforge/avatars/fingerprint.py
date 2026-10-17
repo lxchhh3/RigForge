@@ -14,6 +14,23 @@ from typing import Iterable
 
 _SEPARATORS_RE = re.compile(r"[\s_\-\.]+")
 
+# MochiFitter's FBX exports name every body bone `<bone>_MFBase` where the
+# native FBX carries the bare name (`Left leg_MFBase` vs `Left leg`).
+_RIG_SUFFIXES = ("_MFBase",)
+
+
+def strip_rig_suffix(name: str) -> str:
+    """Drop a fitting tool's trailing bone-name suffix (`Hips_MFBase` → `Hips`),
+    so a bone reads as the avatar bone it stands for. The name matchers (Phase
+    A's donor fingerprint, Phase C's name-based repoint) use it; the decision
+    cache key does NOT, so a suffixed export never shares cached decisions
+    (keyed by its own model ids) with the native file.
+    """
+    for suffix in _RIG_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
 
 def normalize_bone_name(name: str) -> str:
     """Lowercase, strip separator chars (`_`, `-`, `.`, whitespace), drop common

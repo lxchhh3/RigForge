@@ -38,6 +38,7 @@ from rigforge.ascii_fbx.edits import (
     apply_edits,
     drop_blend_shape_channel_edits,
     drop_bone_edits,
+    drop_cluster_edits,
     drop_mesh_edits,
     drop_node_edit,
     mesh_blend_shape_channel_ids,
@@ -52,6 +53,7 @@ from rigforge.ascii_fbx.edits import (
 from rigforge.ascii_fbx.lexer import parse as parse_fbx
 from rigforge.ascii_fbx.merge import (
     bone_keep_strip_edits,
+    empty_cluster_ids,
     id_offset_edits,
     positioned_args,
     splice_into_section_edit,
@@ -67,6 +69,7 @@ from rigforge.ascii_fbx.sections import (
     model_world_matrix,
 )
 from rigforge.ascii_fbx.transform import LocalTransform, affine_inverse, affine_to_fbx_local
+from rigforge.avatars.fingerprint import strip_rig_suffix
 from rigforge.avatars.registry import AvatarRegistry, CuratedAvatar
 from rigforge.canonical.decisions import DecisionSet
 from rigforge.naming import load_translation_table, translate_name
@@ -543,6 +546,7 @@ def _build_name_based_repoint(
     matched = 0
     total = 0
     via_rename = 0
+    via_suffix = 0
     for b in clothing_view.bones.values():
         if b.type_class != "LimbNode":
             continue
@@ -550,6 +554,11 @@ def _build_name_based_repoint(
         if b.model_id in dropped:
             continue
         tid = target_by_name.get(b.name)
+        if tid is None and strip_rig_suffix(b.name) != b.name:
+            # A MochiFitter export's `Hips_MFBase` is the target's `Hips`.
+            tid = target_by_name.get(strip_rig_suffix(b.name))
+            if tid is not None:
+                via_suffix += 1
         if tid is None:
             # Name miss. The clothing bone might still BE a canonical bone the
             # target carries — just under a different name (e.g. it kept a
@@ -574,6 +583,7 @@ def _build_name_based_repoint(
         matched += 1
     notes.append(
         f"name-repoint: matched {matched}/{total} clothing bones to target"
+        + (f" ({via_suffix} via _MFBase suffix strip)" if via_suffix else "")
         + (f" ({via_rename} via canonical rename-target fallback)" if via_rename else "")
     )
     return repoint_table, kept_bone_ids
@@ -652,7 +662,18 @@ def _run_merge(
     doomed_cluster_ids: set[int] = set()
     for _mid in drop_mesh_ids:
         doomed_cluster_ids |= mesh_cluster_ids(clothing_view, _mid)
+    # The clothing's weightless clusters go too (their bind poses would
+    # override the target bones' rest; see empty_cluster_ids), so the rename
+    # pass must skip their blocks as well.
+    empty_clusters = empty_cluster_ids(clothing_view) - doomed_cluster_ids
+    doomed_cluster_ids |= empty_clusters
     strip_edits: list[TextEdit] = []
+    for cid in sorted(empty_clusters):
+        strip_edits.extend(drop_cluster_edits(clothing_view, clothing_view.clusters[cid]))
+    if empty_clusters:
+        notes.append(
+            f"empty_clusters: dropped {len(empty_clusters)} clothing clusters with no weights"
+        )
     for bid in kept_bone_ids:
         bone = clothing_view.bones.get(bid)
         if bone is None:
@@ -831,7 +852,7 @@ def _run_merge(
     #    id by a safe constant, using repoint to redirect bone references.
     stripped_doc = parse_fbx(stripped)
     stripped_view = extract(stripped_doc)
-    offset = _compute_safe_offset(target_view)
+    offset = _compute_safe_offset(target_view, stripped_view)
     notes.append(f"offset: shifting clothing ids by {offset}")
     offset_edits = id_offset_edits(stripped_view, offset=offset, repoint=repoint_table)
     offset_ascii = apply_edits(stripped, offset_edits)
@@ -973,14 +994,41 @@ def _run_merge(
     return merged
 
 
-def _compute_safe_offset(target_view: SectionView) -> int:
+# FBX object ids are signed 64-bit. An id past this survives in the merged
+# ASCII but the binary conversion drops its object without an error.
+_FBX_MAX_ID = 2**63 - 1
+
+
+def _compute_safe_offset(
+    target_view: SectionView, clothing_view: Optional[SectionView] = None,
+) -> int:
     """Pick an id offset larger than any id present in the target ASCII.
 
     Scans the target's Objects for max numeric id. Takes the VIEW being
     merged into (not the curated avatar) so a chained compose clears the
     previous garment's already-offset ids too, not just the bare avatar's.
+
+    Rounds up at the max id's leading digit (2_226_623_424_832 →
+    3_000_000_000_000), so a chain grows by about one garment's ids per merge.
+    The old power of 10 with a spare digit (→ 1e14) added two digits per
+    garment and put the 4th past int64 (save_08's watch vanished, 2026-10-17).
+    With `clothing_view`, refuses an offset its shifted ids would not fit.
     """
-    view = target_view
+    max_id = _max_object_id(target_view)
+    step = 10 ** (len(str(max_id)) - 1)
+    offset = (max_id // step + 1) * step
+    if clothing_view is not None:
+        top = offset + _max_object_id(clothing_view)
+        if top > _FBX_MAX_ID:
+            raise PhaseCError(
+                f"clothing ids shifted by {offset} reach {top}, past FBX's 64-bit "
+                f"id limit {_FBX_MAX_ID}: the binary conversion would drop them"
+            )
+    return offset
+
+
+def _max_object_id(view: SectionView) -> int:
+    """Largest numeric id among `view`'s bones, clusters and Objects (0 if none)."""
     candidates = [b.model_id for b in view.bones.values()]
     candidates.extend(view.clusters.keys())
     # Also scan ALL Objects (NodeAttributes, Geometries, Materials, Textures,
@@ -994,10 +1042,7 @@ def _compute_safe_offset(target_view: SectionView) -> int:
                 if tok.kind == "num":
                     candidates.append(int(tok.value))
                     break
-    max_id = max(candidates) if candidates else 0
-    # Round up to a clean power-of-10 boundary above the max.
-    boundary = 10 ** (len(str(max_id)) + 1)
-    return boundary
+    return max(candidates) if candidates else 0
 
 
 def _compute_dedup_repoint(

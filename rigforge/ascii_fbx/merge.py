@@ -300,6 +300,27 @@ def bone_keep_strip_edits(view: SectionView, bone: BoneRecord) -> list[TextEdit]
 # ---------------------------------------------------------------------------
 
 
+def empty_cluster_ids(view: SectionView) -> set[int]:
+    """Clusters that skin no vertex (`weight_count == 0`) in a Skin that has at
+    least one weighted cluster.
+
+    Such a cluster deforms nothing, but its TransformLink still states a bind
+    pose for its bone, and Blender takes a bone's rest from it once merged onto
+    the target: MochiFitter exports skin a mesh to every bone of the fitted
+    scene (save_08's watch moved 27 tail/jacket bone rests, up to 538 mm). A
+    Skin with NO weighted cluster is left whole: emptying it would turn a
+    skinned mesh into an unskinned one.
+    """
+    weighted_skins = {
+        view.cluster_skin[cid] for cid, c in view.clusters.items()
+        if c.weight_count > 0 and cid in view.cluster_skin
+    }
+    return {
+        cid for cid, c in view.clusters.items()
+        if c.weight_count == 0 and view.cluster_skin.get(cid) in weighted_skins
+    }
+
+
 def zero_weight_leaf_bone_ids(view: SectionView) -> set[int]:
     """Identify LimbNode bones that contribute no skin weight to any vertex
     AND have no surviving non-zero-weight descendants. Iterative leaf prune:
