@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { ComposedClothing } from '../stores/compose'
-import { useComposeStore } from '../stores/compose'
+import { isProp, useComposeStore } from '../stores/compose'
 import MeshList from './MeshList.vue'
 import BlendShapeList from './BlendShapeList.vue'
 import GeometryEditPanel from './GeometryEditPanel.vue'
@@ -57,6 +57,9 @@ function remove() {
         <template v-if="clothing.inspect.rigid">
           <strong data-testid="rigid-badge">rigid garment (no bones)</strong>
         </template>
+        <template v-else-if="clothing.inspect.self_rigged">
+          <strong data-testid="self-rigged-badge">prop with its own armature (no avatar bones)</strong>
+        </template>
         <template v-else>
           donor: <strong>{{ clothing.inspect.donor_id ?? 'unknown' }}</strong>
           <span v-if="clothing.inspect.donor_id">
@@ -65,7 +68,7 @@ function remove() {
         </template>
         — {{ meshCount }} meshes, {{ channelCount }} blendshapes
       </div>
-      <div v-if="clothing.inspect.rigid" class="attach">
+      <div v-if="isProp(clothing.inspect)" class="attach">
         <label>
           attach to bone
           <select v-model="attachValue" data-testid="attach-bone" class="attach-select">

@@ -126,6 +126,7 @@ rigforge/
 │   │                 names → EN); name-based repoint has a rename-target
 │   │                 fallback so a misnamed canonical bone strips, not doubles
 │   ├── edit_plan.py  EditPlan.from_decisions (drops + renames + reparents)
+│   ├── bake_moves.py move on a kept (replaced) bone -> the clothing's vertices
 │   └── orchestrator.py  assemble() — full bin→ASCII→A→B→C→ASCII→bin;
 │                     emits progress_cb(phase, note) at each phase boundary
 ├── sections/
@@ -135,6 +136,19 @@ rigforge/
 ├── api/
 │   └── server.py     FastAPI app factory; the v2 bridge between Python
 │                     pipeline and the Vite/Vue compose UI. See "API surface".
+├── unity/           read a saved Unity scene into a compose pre-fill (v3):
+│   ├── yaml_docs.py      Unity YAML -> documents (PyYAML base loader: every
+│   │                     scalar a string) + prefab-override property paths
+│   ├── hierarchy.py      UnityProject (guid index) + expand(): prefab
+│   │                     instances flattened with Unity's nested-id rule
+│   │                     (instance ^ inner) & 0x7FFF..., overrides applied,
+│   │                     stripped placeholders aliased; Unity-frame worlds
+│   ├── modular_avatar.py MA Object Toggle + Shape Changer (MA's own condition
+│   │                     rules), Bone Proxy
+│   ├── library.py        names of objects INSIDE an imported model, from its
+│   │                     import artifact in Library/Artifacts (SerializedFile)
+│   └── scene_read.py     read_scene(): target + one clothing per garment FBX,
+│                         ids resolved against the inspect views
 ├── manifest.py       run report emitter
 └── cli.py            `rigforge assemble` + `rigforge inspect` + `rigforge serve`
 ```
@@ -147,6 +161,7 @@ rigforge/
 |--------|-----------------------------------|---------|
 | GET    | `/api/avatars`                    | List curated avatars + their canonical roles |
 | GET    | `/api/avatars/{id}/inspect`       | Parse a curated avatar's ASCII FBX; return bone records (typed: LimbNode / Mesh / Null) for the FE outliner |
+| POST   | `/api/unity/scene`                | Read a saved `.unity` scene into a compose pre-fill (`{target_id, target, clothings[], skipped[], notes[]}`) in inspect ids. See "Unity scene read" |
 | POST   | `/api/clothings/inspect`          | Same shape as avatar inspect, but for a clothing path. Auto-converts binary FBX through `fbx_env` and caches the ASCII under `data/_inspect_cache/` |
 | POST   | `/api/assemble`                   | Run the full pipeline. ONE garment via `clothing_path` + flat pre-filters (`drop_mesh_ids`, `drop_bone_ids`, channel drops/overrides, bone moves), or SEVERAL via `clothings: [{clothing_path, drop_mesh_ids, ...}, ...]` — each with its own selections — merged in order into ONE output (`<stemA>+<stemB>__<target>.fbx`). Target-side pre-filters (`target_drop_mesh_ids`, ...) stay top-level and apply once |
 | GET    | `/api/assemblies`                 | List recent manifests in `data_dir` |
@@ -178,6 +193,51 @@ Compose.vue
 The modder never sees bones. Bone-level drops still exist in the API for power use, but the UI surfaces only mesh model_ids — Maya's rigging convention puts every bone in every mesh's skin, so a bone-level UI lies about what a checkbox actually does. Mesh ids are the honest unit.
 
 `drop_mesh_edits` (in `ascii_fbx/edits.py`) removes a mesh as one consistent chain: Mesh-Model + Geometry + Skin + every Cluster of that Skin + all referencing connections. Bones are left in place (they're shared across meshes; cascading bone cleanup would corrupt siblings).
+
+## Unity scene read — "Load Unity scene" (v3)
+
+kevin sets the avatar up in Unity first, so the Compose page reads that setup
+instead of having him re-enter it (his ask, 2026-10-28). `POST /api/unity/scene`
+reads the SAVED scene (save in Unity first) and the FE's `UnityScenePanel`
+replaces the compose with the result; he reviews, then Assembles as usual.
+
+- **Target** = the scene-root object holding >= 90% of a registry avatar's
+  bone names (containment, not Jaccard: a Unity prefab adds colliders/props).
+- **Garments** = the top-level prefab / model instances under it; one clothing
+  per FBX they use. A renderer whose mesh lives in another asset (MochiFitter's
+  `.omochi`) stands for the same-named FBX beside it (none there = reported).
+  Renderers of another FBX inside the avatar's OWN prefab (a vendor's
+  avatar+outfit prefab, Chrome_Maya_LilToon) are an embedded garment on the
+  shared armature. Renderers bind to FBX meshes by name (renderer-holding
+  objects first), else a lone renderer to a lone mesh (GG's headset prefab).
+  A garment with every mesh hidden is skipped.
+- **Hidden meshes** -> drops: inactive / EditorOnly objects, disabled
+  renderers, and MA Object Toggles evaluated as MA's build does (nearest Menu
+  Item at its default, inactive parents cancel, `Inverted` flips).
+- **Blendshapes** -> overrides where the effective weight (prefab + scene, then
+  MA Shape Changer `Set` entries) differs from the FBX's DeformPercent; Unity's
+  slot `i` = the mesh's i-th channel in FBX connection order. A Shape Changer
+  `Delete` removes vertices — reported, not carried.
+- **Bone moves** compare WORLD placement: MochiFitter's finalized prefab is a
+  rebuilt hierarchy (Unity folded the FBX's -90 X Armature into the top
+  transforms, `Hips_MFBase` -> `Hips`), so locals differ at the root while
+  every bone sits where the FBX puts it. Parents first; a move is the local the
+  scene implies in the FBX's parent frame (tiny FBX-scale shear tolerated). A
+  moved bone the merge replaces with the avatar's own is sent and BAKED (see
+  Bone moves). > 50% of bones whose OWN local changed = refuse (wrong FBX).
+- **Rigid props** -> attach to the Bone Proxy's bone (or the nearest avatar
+  bone above them) with the placement the BUILD gives (a proxy snaps to its
+  bone), in Phase C's rigid move frame.
+- **Self-rigged props** (own armature, no bone shared with the target — the
+  Toast) are props like rigid ones: Phase A/B pass them through, Phase C
+  strips their Null like any garment's and places/attaches their top bones.
+- **Inside an imported model** (a nested FBX instance's objects are not in
+  YAML): overrides on them are named through the model's import artifact in
+  `Library/Artifacts` (`unity/library.py`): the Toast's moved Armature_Toast
+  and its 'Eat' weight. Stale ones (objects the import no longer has) are
+  counted in the notes.
+- **Skipped**, with the reason: prefabs deleted from the project (Unity's
+  Missing Prefab), garments with every mesh hidden, meshes with no FBX.
 
 ## Geometry pre-step — `taste-edit` (v3)
 
@@ -230,12 +290,17 @@ bone that sits wrong on the target's head.
 - **Where it applies.** `pipeline/bone_transforms.py` resolves each request
   (`BoneTransformEdit`: id or unique name + partial `LocalTransform` + frame)
   against the clothing or target view; Phase C applies clothing-side moves in
-  the strip pass and target-side moves in the target pre-splice pass. Bones the
-  merge replaces with the target's copy (`kept_bone_ids`), dropped bones, and
-  dropped meshes are skipped with a `skip: bone_transform …` note — in the
-  donor==target case that is *every* name-matched clothing bone, so a canonical
-  bone is moved on the target side. An ambiguous name is a hard error (never
-  guess which duplicate). A missing `Lcl Rotation`/`Lcl Scaling` line is
+  the strip pass and target-side moves in the target pre-splice pass. Dropped
+  bones and dropped meshes are skipped with a `skip: bone_transform …` note. A
+  move on a bone the merge replaces with the target's copy (`kept_bone_ids` —
+  in the donor==target case every name-matched clothing bone) is BAKED into
+  the clothing's vertices on it (`pipeline/bake_moves.py`, kevin's pick
+  2026-10-28): each vertex moves by its weight on that bone and on kept bones
+  riding it, normals and blend-shape deltas turn with a real rotation, and
+  ride-along children without their own move follow. Not a bind
+  (`TransformLink`) rewrite as Modular Avatar does: Blender keeps one rest per
+  bone and took the rewritten bind as Maya's Head rest, moving her face 3.6 cm.
+  An ambiguous name is a hard error (never guess which duplicate). A missing `Lcl Rotation`/`Lcl Scaling` line is
   inserted (the SDK elides defaults).
 - **Surfaces:** `rigforge assemble --bone-transform "NAME;pos=x,y,z;rot=x,y,z;scale=x,y,z"`
   (repeatable; `#<id>` for an id; `--target-bone-transform`;

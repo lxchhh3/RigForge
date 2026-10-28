@@ -59,6 +59,11 @@ class InspectRequest(BaseModel):
     target_id: Optional[str] = None
 
 
+class UnitySceneRequest(BaseModel):
+    """A saved Unity scene (.unity) whose setup pre-fills the compose."""
+    scene_path: str
+
+
 class TasteEditRequest(BaseModel):
     """A vertex-count-safe geometry pre-step on a clothing (e.g. cut sole
     height). FE currently exposes only `bisect_cut`."""
@@ -167,6 +172,7 @@ def _build_inspect_response(
     *,
     local_overrides: Optional[dict[int, LocalTransform]] = None,
     rigid_frame: Optional[str] = None,
+    self_rigged: bool = False,
 ) -> dict:
     """Bone-tree response shared by /api/clothings/inspect and
     /api/avatars/{id}/inspect — same shape so the FE can reuse BoneTree.vue
@@ -279,6 +285,9 @@ def _build_inspect_response(
         # No bones, only meshes (a rigid prop): merged as-is; the FE offers
         # "attach to bone" for these. Same predicate as Phase A.
         "rigid": view.is_rigid(),
+        # Its own armature, no bone shared with the target (inspected against
+        # one): a prop like a rigid garment — attach + placement apply.
+        "self_rigged": self_rigged,
         # The Model whose frame a rigid garment's top-level mesh values are
         # given in (the target's Armature); None = the file's own values.
         "rigid_frame": rigid_frame,
@@ -406,31 +415,58 @@ def create_app(
         # top-level meshes open the Move panel on their placement there.
         local_overrides: dict[int, LocalTransform] = {}
         rigid_frame: Optional[str] = None
+        self_rigged = False
         if req.target_id is not None:
             try:
                 target_view = registry.get(req.target_id).load_ascii_view()
             except RegistryError as e:
                 raise HTTPException(status_code=400, detail=str(e))
-            if view.is_rigid():
+            from rigforge.pipeline.phase_a import is_self_rigged
+            self_rigged = is_self_rigged(view, target_view)
+            if view.is_rigid() or self_rigged:
                 from rigforge.pipeline.phase_c import (
-                    PhaseCError, rigid_local_in_frame, rigid_move_frame,
+                    PhaseCError, prop_roots, rigid_local_in_frame, rigid_move_frame,
                 )
                 try:
                     frame_id, frame_world = rigid_move_frame(target_view)
                     if frame_id is not None:
                         rigid_frame = target_view.bones[frame_id].name
-                        for m in view.bones_of_type("Mesh"):
-                            if m.parent_id in (None, 0):
-                                local_overrides[m.model_id] = rigid_local_in_frame(
-                                    view, m.model_id, frame_world,
-                                )
+                        for m in prop_roots(view, self_rigged=self_rigged):
+                            local_overrides[m.model_id] = rigid_local_in_frame(
+                                view, m.model_id, frame_world,
+                            )
                 except PhaseCError as e:
                     raise HTTPException(status_code=400, detail=str(e))
 
         return _build_inspect_response(
             view, donor_id, donor_score,
             local_overrides=local_overrides, rigid_frame=rigid_frame,
+            self_rigged=self_rigged,
         )
+
+    @app.post("/api/unity/scene")
+    def read_unity_scene(req: UnitySceneRequest) -> dict:
+        """Read kevin's saved Unity scene into a compose pre-fill: the target,
+        one clothing per garment FBX, and per side the hidden meshes, changed
+        blendshapes and moved bones — in the same ids the inspect endpoints
+        return (the garment FBXs go through the same shared bin->ASCII cache).
+        What cannot be carried comes back in `skipped` / `notes`."""
+        from rigforge.unity.scene_read import SceneReadError, read_scene
+
+        # Explorer's "Copy as path" wraps the path in double quotes.
+        p = Path(req.scene_path.strip().strip('"'))
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"scene not found: {p}")
+
+        def load_view(fbx: Path) -> SectionView:
+            ascii_path = bin_to_ascii_cached(Path(fbx), output_dir / "_fbx_ascii_cache")
+            return extract_sections(parse_fbx(ascii_path.read_bytes()))
+
+        try:
+            res = read_scene(p, registry=registry, load_view=load_view)
+        except SceneReadError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return res.to_dict()
 
     @app.get("/api/avatars/{avatar_id}/inspect")
     def inspect_avatar(avatar_id: str) -> dict:

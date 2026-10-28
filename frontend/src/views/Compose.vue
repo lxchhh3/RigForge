@@ -6,6 +6,7 @@ import { useComposeStore } from '../stores/compose'
 import ClothingItem from '../components/ClothingItem.vue'
 import TargetPanel from '../components/TargetPanel.vue'
 import AssembleProgressList from '../components/AssembleProgressList.vue'
+import UnityScenePanel from '../components/UnityScenePanel.vue'
 
 const avatarsStore = useAvatarsStore()
 const compose = useComposeStore()
@@ -52,6 +53,8 @@ async function runAssemble() {
         Pick a target avatar, add the clothings you want to rig onto it, uncheck parts you don't want, then assemble.
       </p>
     </header>
+
+    <UnityScenePanel />
 
     <section class="row target-row">
       <label for="target">Target avatar:</label>

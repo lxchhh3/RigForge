@@ -74,6 +74,8 @@ from rigforge.avatars.registry import AvatarRegistry, CuratedAvatar
 from rigforge.canonical.decisions import DecisionSet
 from rigforge.naming import load_translation_table, translate_name
 
+from .bake_moves import bake_kept_bone_moves
+from .phase_a import is_self_rigged
 from .bone_transforms import (
     BoneTransformEdit,
     BoneTransformError,
@@ -165,6 +167,23 @@ def rigid_local_in_frame(
         raise PhaseCError(f"rigid: {name!r}: {exc}") from exc
 
 
+def prop_roots(clothing_view: SectionView, *, self_rigged: bool) -> list:
+    """The top-level Models a prop is placed by. Rigid: its top-level meshes.
+    Self-rigged: every top-level Model except a SKINNED mesh — its own
+    armature root(s) carry its bones, and a skinned mesh follows them."""
+    tops = [b for b in clothing_view.bones.values() if b.parent_id in (None, 0)]
+    if not self_rigged:
+        return [b for b in tops if b.type_class == "Mesh"]
+    # Its top Null(s) are stripped like any garment's armature root, so the
+    # prop is placed by what hangs directly under them (and by top-level
+    # Models that are not Nulls).
+    top_nulls = {b.model_id for b in tops if b.type_class == "Null"}
+    under = [b for b in clothing_view.bones.values() if b.parent_id in top_nulls]
+    cands = [b for b in tops if b.type_class != "Null"] + under
+    return [b for b in cands
+            if not (b.type_class == "Mesh" and mesh_cluster_ids(clothing_view, b.model_id))]
+
+
 def _place_rigid_edits(
     clothing_view: SectionView,
     target_view: SectionView,
@@ -174,6 +193,7 @@ def _place_rigid_edits(
     skip: set[int],
     attached: dict[int, int],
     notes: list[str],
+    roots: Optional[list] = None,
 ) -> list[TextEdit]:
     """Hang a rigid garment's top-level meshes from TARGET bone
     `attach_to_bone_id` (so they follow it), else from the target's Armature
@@ -206,8 +226,10 @@ def _place_rigid_edits(
         raise PhaseCError(str(exc)) from exc
 
     edits: list[TextEdit] = []
-    for m in clothing_view.bones_of_type("Mesh"):
-        if m.parent_id not in (None, 0) or m.model_id in skip:
+    if roots is None:
+        roots = prop_roots(clothing_view, self_rigged=False)
+    for m in roots:
+        if m.model_id in skip:
             continue
         cur = rigid_local_in_frame(clothing_view, m.model_id, frame_world)
         mv = moves.get(m.model_id) or LocalTransform()
@@ -445,9 +467,11 @@ def run_phase_c(
     untouched, so the mesh follows — same as dragging the bone in Unity).
     Clothing bones the merge replaces with the target's copy, and dropped
     bones/meshes on either side, are skipped with a note.
-    `attach_to_bone_id` (a rigid garment only - no bones): hang its top-level
-    meshes from this TARGET bone so they follow it; without it a rigid
-    garment hangs from the target's Armature. Like dragging them there in
+    `attach_to_bone_id` (a prop only - a rigid garment with no bones, or a
+    self-rigged one whose own armature shares no bone with the target): hang
+    its top-level meshes (rigid) or its armature root(s) (self-rigged) from
+    this TARGET bone so they follow it; without it a prop hangs from the
+    target's Armature. Like dragging them there in
     Unity's Hierarchy, they keep their world placement (their move above
     reads in the Armature frame — Unity's numbers for a prop under the
     avatar's Armature) and only the parent changes.
@@ -724,13 +748,22 @@ def _run_merge(
     armature_dst = _find_target_armature_null(target_view)
     if armature_dst is None:
         armature_dst = 0
+    # A self-rigged prop (its own armature, no bone shared with the target)
+    # loses its Null like any garment — kept under Maya's Armature, Blender
+    # turned it into a bone and hung the prop's meshes rigidly from it, with
+    # no Armature modifier (2026-10-28). Its top bones then hang from the
+    # attach bone (else the Armature) and are placed below like a rigid prop.
+    self_rigged = is_self_rigged(clothing_view, target_view)
+    null_dst = attach_to_bone_id if (self_rigged and attach_to_bone_id is not None) else armature_dst
     for b in clothing_view.bones.values():
         if b.type_class == "Null":
             strip_edits.extend(bone_keep_strip_edits(clothing_view, b))
-            repoint_table[b.model_id] = armature_dst
+            repoint_table[b.model_id] = null_dst
+    if self_rigged:
+        notes.append("self-rigged prop: its own bones ride along, placed where it stands")
     notes.append(
         f"armature_reparent: clothing armature children -> "
-        f"{'target armature ' + str(armature_dst) if armature_dst else 'scene root 0'}"
+        f"{'target ' + str(null_dst) if null_dst else 'scene root 0'}"
     )
 
     # Apply user mesh drops on the clothing side (e.g., outfit ships with a
@@ -817,18 +850,38 @@ def _run_merge(
     # parent's frame (world placement kept, the Armature-frame move folded
     # in); their parent link is rewritten after the offset pass below.
     attached: dict[int, int] = {}
-    if attach_to_bone_id is not None or clothing_view.is_rigid():
+    if attach_to_bone_id is not None or clothing_view.is_rigid() or self_rigged:
         strip_edits.extend(_place_rigid_edits(
             clothing_view, target_view, attach_to_bone_id, bone_transforms,
             skip=set(drop_mesh_ids), attached=attached, notes=notes,
+            roots=prop_roots(clothing_view, self_rigged=self_rigged),
         ))
+    # A move on a bone the merge replaces with the target's copy is baked
+    # into the clothing's vertices on it (and on kept bones riding it); a
+    # Bone move cannot land there, and a bind rewrite would move the
+    # target's own bone rest in Blender (see bake_moves).
+    baked: set[int] = set()
+    if bone_transforms and kept_bone_ids:
+        try:
+            resolved_moves = resolve_bone_transform_edits(
+                clothing_view, bone_transforms, notes=[], side="clothing",
+            )
+        except BoneTransformError as exc:
+            raise PhaseCError(str(exc)) from exc
+        bake = bake_kept_bone_moves(
+            clothing_view, resolved_moves, kept_bone_ids - dropped_ids,
+            skip_mesh_ids=set(drop_mesh_ids), skip_bone_ids=dropped_ids,
+            explicit_move_ids=set(resolved_moves), notes=notes,
+        )
+        strip_edits.extend(bake.edits)
+        baked = bake.baked_bone_ids
     strip_edits.extend(_bone_transform_edits(
         clothing_view, bone_transforms,
         untouchable=kept_bone_ids | dropped_ids | set(drop_mesh_ids),
         untouchable_reason=(
             "replaced by the target's copy or dropped; move it on the target side"
         ),
-        side="clothing", notes=notes, handled=frozenset(attached),
+        side="clothing", notes=notes, handled=frozenset(attached) | frozenset(baked),
     ))
 
     # Translate clothing morph + mesh names to English — ALWAYS. Clothing names
@@ -856,10 +909,17 @@ def _run_merge(
     notes.append(f"offset: shifting clothing ids by {offset}")
     offset_edits = id_offset_edits(stripped_view, offset=offset, repoint=repoint_table)
     offset_ascii = apply_edits(stripped, offset_edits)
-    if attached:
+    # Placed Models at the scene root get their new parent here; ones under a
+    # stripped Null (a self-rigged prop's top bones) already got it through
+    # the repoint table.
+    root_attached = {
+        mid: bone for mid, bone in attached.items()
+        if clothing_view.bones[mid].parent_id in (None, 0)
+    }
+    if root_attached:
         offset_ascii = _reparent_root_links(
             offset_ascii,
-            {repoint_table.get(mid, mid + offset): bone for mid, bone in attached.items()},
+            {repoint_table.get(mid, mid + offset): bone for mid, bone in root_attached.items()},
         )
 
     # 4. Splice pass: extract clothing's surviving Objects + Connections

@@ -1286,13 +1286,14 @@ def test_phase_c_passthrough_moves_target_bone_by_name(maya_fbx_ascii: Path, reg
     assert any("bone_transform: moved 1 target" in n for n in result.notes)
 
 
-def test_phase_c_passthrough_clothing_move_on_replaced_bone_is_skipped(
+def test_phase_c_passthrough_clothing_move_on_replaced_bone_is_baked_into_its_vertices(
     maya_fbx_ascii: Path, registry,
 ):
     """donor==target replaces every name-matched clothing bone with the
-    target's copy, so a CLOTHING-side move on such a bone has nothing to land
-    on. It must be skipped with a note (not crash by overlapping the strip),
-    and the output keeps the target's original position."""
+    target's copy, so a CLOTHING-side move on such a bone cannot move a bone.
+    Since 2026-10-28 (kevin's pick) it is baked into the clothing's vertices
+    on that bone instead of skipped: the target's bone keeps its position,
+    the clothing's Hat mesh moves."""
     raw = maya_fbx_ascii.read_bytes()
     view = extract(parse(raw))
     hat_before = next(b for b in view.limb_bones() if b.name == "Hat Root").translation_xyz
@@ -1305,8 +1306,10 @@ def test_phase_c_passthrough_clothing_move_on_replaced_bone_is_skipped(
     )
     _, hat = _out_bone(result.merged_ascii, "Hat Root")
     assert hat.translation_xyz == hat_before
-    assert any(n.startswith("skip: bone_transform") and "Hat Root" in n for n in result.notes)
-    assert not any("bone_transform: moved" in n for n in result.notes)
+    assert not any(n.startswith("skip: bone_transform") for n in result.notes)
+    bake = [n for n in result.notes if n.startswith("bake:")]
+    assert len(bake) == 1 and "'Hat Root'" in bake[0] and "Hat" in bake[0]
+    extract(parse(result.merged_ascii))
 
 
 def test_phase_c_cross_avatar_moves_ride_along_clothing_bone_in_unity_frame(

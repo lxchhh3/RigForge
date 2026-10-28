@@ -994,3 +994,70 @@ def test_assemble_stream_tags_events_with_clothing_index(
     assert [e["clothing_index"] for e in progress] == [0, 1, 1, 1]
     assert events[-1]["event"] == "done"
     assert events[-1]["id"] == f"{maya_fbx_ascii.stem}+second_garment"
+
+
+# --- Unity scene read (pre-fills the compose from kevin's saved scene) -------
+
+
+def _unity_client(tmp_path: Path):
+    from tests.test_unity_scene_read import build_scene_project
+    scene, registry, paths = build_scene_project(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    app = create_app(data_dir=out, registry=registry, output_dir=out)
+    return TestClient(app), scene, paths
+
+
+def test_unity_scene_read_returns_the_compose_prefill(tmp_path: Path):
+    client, scene, paths = _unity_client(tmp_path)
+    r = client.post("/api/unity/scene", json={"scene_path": str(scene)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["target_id"] == "ava"
+    assert body["target"]["drop_mesh_ids"] == [5]
+    by_path = {c["clothing_path"]: c for c in body["clothings"]}
+    assert by_path[str(paths["outfit"])]["drop_mesh_ids"] == [15]
+    assert by_path[str(paths["pin"])]["attach_to_bone_id"] == 3
+    assert body["skipped"] == []
+    assert any(c["self_rigged"] for c in body["clothings"])
+    assert body["notes"]
+
+
+def test_unity_scene_read_strips_explorer_quotes(tmp_path: Path):
+    client, scene, _ = _unity_client(tmp_path)
+    r = client.post("/api/unity/scene", json={"scene_path": f'"{scene}"'})
+    assert r.status_code == 200, r.text
+
+
+def test_unity_scene_read_missing_file_is_404(tmp_path: Path):
+    client, _, _ = _unity_client(tmp_path)
+    r = client.post("/api/unity/scene", json={"scene_path": str(tmp_path / "nope.unity")})
+    assert r.status_code == 404
+
+
+def test_unity_scene_read_without_an_avatar_is_400(tmp_path: Path):
+    from tests.unity_fixtures import HEADER, game_object, write_asset
+    client, scene, _ = _unity_client(tmp_path)
+    empty = write_asset(scene.parent.parent, "Assets/Empty.unity",
+                        HEADER + game_object(1, "Cube", []), "9" * 32)
+    r = client.post("/api/unity/scene", json={"scene_path": str(empty)})
+    assert r.status_code == 400
+    assert "registry avatar" in r.json()["detail"]
+
+
+def test_inspect_flags_a_self_rigged_prop_against_its_target(client: TestClient, tmp_path: Path):
+    """kevin's Toast (2026-10-28): its own armature, no bone shared with Maya.
+    The FE offers attach + placement for it like a rigid prop; its armature
+    root opens the Move panel in Maya's Armature frame."""
+    from tests.test_self_rigged import PROP
+    p = tmp_path / "toast.fbx"
+    p.write_bytes(PROP)
+    body = client.post("/api/clothings/inspect", json={"path": str(p), "target_id": "maya"}).json()
+    assert body["self_rigged"] is True and body["rigid"] is False
+    assert body["rigid_frame"] == "Armature"
+    # Its top bone (its Null goes, as for every garment) opens in Maya's
+    # -90 X Armature frame: +90 X at the file's own placement.
+    root = next(b for b in body["bones"] if b["name"] == "PB_Toast_01")
+    assert root["local_transform_unity"]["rotation"] == pytest.approx([90.0, 0.0, 0.0], abs=1e-4)
+    no_target = client.post("/api/clothings/inspect", json={"path": str(p)}).json()
+    assert no_target["self_rigged"] is False

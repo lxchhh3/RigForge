@@ -217,3 +217,38 @@ test('the attach pick survives a reload', async ({ page }) => {
   const again = page.getByTestId('clothing-item').filter({ hasText: 'GG_headset' })
   await expect(again.getByTestId('attach-bone')).toHaveValue('150')
 })
+
+// kevin's Toast (2026-10-28): a prop with its OWN small armature that shares no
+// bone with Maya. The BE flags it `self_rigged` (inspected against the target);
+// the FE treats it as a prop: attach picker, its armature root placed in the
+// Armature frame, and the pick goes out as attach_to_bone_id.
+const SELF_RIGGED_INSPECT = {
+  donor_id: null,
+  donor_score: 0,
+  total_bones: 3,
+  rigid: false,
+  self_rigged: true,
+  rigid_frame: 'Armature',
+  bones: [
+    { model_id: 30, name: 'Armature_Toast', type_class: 'Null', parent_id: null, subtree_size: 2, cluster_weight_count: 0, deforms_meshes: [], local_transform_unity: LT([0, 0, 0], [90, 0, 0], [1, 1, 1]) },
+    { model_id: 31, name: 'PB_Toast_01', type_class: 'LimbNode', parent_id: 30, subtree_size: 1, cluster_weight_count: 40, deforms_meshes: ['EC_Toast'], local_transform_unity: LT([0, 0.0035, 0], [0, 0, 0], [1, 1, 1]) },
+    { model_id: 40, name: 'EC_Toast', type_class: 'Mesh', parent_id: null, subtree_size: 1, cluster_weight_count: 0, deforms_meshes: [], local_transform_unity: LT([0, 0, 0], [0, 0, 0], [1, 1, 1]) },
+  ],
+  blend_shape_channels: [],
+}
+
+test('a self-rigged prop gets the attach picker and sends its pick', async ({ page }) => {
+  const sink: unknown[] = []
+  await mockAll(page, sink)
+  await page.route('**/api/clothings/inspect', (r) => jsonFulfill(r, SELF_RIGGED_INSPECT))
+  await page.goto('/')
+  await expect(page.getByTestId('target-panel')).toBeVisible()
+  const item = await addClothing(page, 'C:/fixtures/EclatAndCrumb_Toast.fbx')
+
+  await expect(item.getByTestId('self-rigged-badge')).toContainText('own armature')
+  const pick = item.getByTestId('attach-bone')
+  await expect(pick.locator('option[value=""]')).toContainText('Armature')
+  await pick.selectOption('150')
+  const body = await assembleAndCapture(page, sink)
+  expect(body.clothings[0].attach_to_bone_id).toBe(150)
+})

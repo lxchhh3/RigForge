@@ -2,7 +2,7 @@
 
 Standalone Python tool for MHWilds clothing modding. Takes a Booth-purchased clothing FBX rigged for some other base avatar, retargets it onto a curated avatar, and emits a clean assembly FBX that REE-ModPilot's Phase D pipeline consumes.
 
-The user-facing slice is a compose UI: pick an avatar, add clothing FBX paths, uncheck the meshes you don't want, drop or adjust the DeformPercent (0–100) on each blendshape with a slider, then assemble — a live progress bar shows phase + status per clothing.
+The user-facing slice is a compose UI: pick an avatar, add clothing FBX paths, uncheck the meshes you don't want, drop or adjust the DeformPercent (0–100) on each blendshape with a slider, then assemble — a live progress bar shows phase + status per clothing. Or **Load Unity scene**: point it at a saved `.unity` and it fills all of that in from the Unity setup (outfits/props on the avatar, Modular Avatar toggles, blendshape values, bone and prop moves), listing anything it could not carry.
 
 See [PLAN.md](PLAN.md) for the design doc + scope decisions, [ARCHITECTURE.md](ARCHITECTURE.md) for what's actually built, and [frontend/README.md](frontend/README.md) for the FE specifics.
 

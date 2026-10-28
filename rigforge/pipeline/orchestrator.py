@@ -217,19 +217,22 @@ def assemble(
             cfbx, registry, work_dir=work_dir, ascii_cache_dir=ascii_cache_dir,
             target_id=target_id,
         )
-        if spec.attach_to_bone_id is not None and not a.rigid:
+        if spec.attach_to_bone_id is not None and not (a.rigid or a.self_rigged):
             raise PipelineError(
-                f"{cfbx.name}: attach to a bone applies only to a garment with "
-                f"no bones (a rigid mesh); this one is rigged"
+                f"{cfbx.name}: attach to a bone applies only to a prop — a garment with "
+                f"no bones (a rigid mesh) or with its own armature; this one is rigged"
             )
-        if a.rigid:
-            # --- No bones (a rigid prop): nothing to match, nothing to classify.
-            _emit("phase_a", f"{label}rigid garment (no bones): merged as-is onto {target_id}")
+        if a.rigid or a.self_rigged:
+            # --- A prop: nothing to match, nothing to classify.
+            what = ("rigid garment (no bones)" if a.rigid
+                    else "self-rigged prop (its own armature)")
+            _emit("phase_a", f"{label}{what}: merged as-is onto {target_id}")
             b = PhaseBResult(
                 decisions=DecisionSet(bones=[]), edit_plan=EditPlan(),
                 warnings=[], cache_hit=False, cache_key="",
             )
-            _emit("phase_b", f"{label}no bones to classify — LLM skipped")
+            _emit("phase_b", f"{label}no bones to classify — LLM skipped" if a.rigid
+                  else f"{label}its own bones ride along as-is — LLM skipped")
         else:
             _emit("phase_a", f"{label}donor={a.donor_id} score={a.score:.2f}")
 

@@ -34,6 +34,21 @@ class PhaseAResult:
     # nothing to match a donor on, so the target stands in as its donor and
     # Phase B has nothing to classify; Phase C merges its meshes as-is.
     rigid: bool = False
+    # A prop with its OWN armature sharing no bone with the target (kevin's
+    # Toast). Same as rigid for Phase A/B; Phase C keeps its armature whole.
+    self_rigged: bool = False
+
+
+def is_self_rigged(view: SectionView, target_view: SectionView) -> bool:
+    """A garment with bones, none of which is a bone of the target (by name,
+    fitting-tool suffix stripped): a prop with its own small armature, merged
+    as-is. The one predicate Phase A, Phase C and the inspect API use. A
+    garment sharing ANY bone with the target is a garment for an avatar."""
+    own = {strip_rig_suffix(b.name) for b in view.limb_bones() if b.name}
+    if not own:
+        return False
+    theirs = {strip_rig_suffix(b.name) for b in target_view.limb_bones() if b.name}
+    return not (own & theirs)
 
 
 def run_phase_a(
@@ -85,6 +100,11 @@ def run_phase_a(
             donor_id=target_id, score=0.0, candidates=[],
             ascii_path=ascii_path, view=view, rigid=True,
         )
+    if target_id is not None and is_self_rigged(view, registry.get(target_id).load_ascii_view()):
+        return PhaseAResult(
+            donor_id=target_id, score=0.0, candidates=[],
+            ascii_path=ascii_path, view=view, self_rigged=True,
+        )
     # Match on base names: a MochiFitter export's `Hips_MFBase` is maya's `Hips`.
     bone_names = [strip_rig_suffix(b.name) for b in view.limb_bones() if b.name]
 
@@ -100,4 +120,4 @@ def run_phase_a(
     )
 
 
-__all__ = ["run_phase_a", "PhaseAResult", "DonorIdentificationError"]
+__all__ = ["run_phase_a", "PhaseAResult", "DonorIdentificationError", "is_self_rigged"]

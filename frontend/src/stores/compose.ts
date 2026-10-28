@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { reactive, ref, watch } from 'vue'
+import { nextTick, reactive, ref, watch } from 'vue'
 
 export type Vec3 = [number, number, number]
 
@@ -54,6 +54,9 @@ export interface InspectedClothing {
   // No bones, only meshes (a rigid prop): merged as-is. The BE decides; the FE
   // then offers "attach to bone". Absent on payloads from older backends.
   rigid?: boolean
+  // A prop with its OWN armature sharing no bone with the target (inspected
+  // against one): treated like a rigid garment — attach + placement apply.
+  self_rigged?: boolean
   // Rigid garment inspected against a target: the target Model (its Armature)
   // whose frame the top-level meshes' local_transform_unity — and their moves —
   // read in, as Unity's Inspector shows a prop under the avatar's Armature.
@@ -126,6 +129,43 @@ export interface TargetState {
   boneTransforms: Map<number, BoneTransformValue>
 }
 
+// What POST /api/unity/scene returns: kevin's saved Unity scene read into a
+// compose pre-fill, in the same ids the inspect payloads use.
+export interface SceneSourceRead {
+  drop_mesh_ids: number[]
+  blend_shape_channel_overrides: { channel_id: number; deform_percent: number }[]
+  bone_transforms: { bone_id: number; position: Vec3; rotation: Vec3; scale: Vec3 }[]
+}
+
+export interface SceneClothingRead extends SceneSourceRead {
+  clothing_path: string
+  source: string
+  rigid: boolean
+  attach_to_bone_id: number | null
+}
+
+export interface SceneSkipped {
+  name: string
+  path: string
+  reason: string
+}
+
+export interface UnitySceneRead {
+  scene: string
+  target_id: string
+  target: SceneSourceRead
+  clothings: SceneClothingRead[]
+  skipped: SceneSkipped[]
+  notes: string[]
+}
+
+// The last scene loaded into the page and what the read said about it.
+export interface UnitySceneReport {
+  path: string
+  notes: string[]
+  skipped: SceneSkipped[]
+}
+
 export interface AssembleResult {
   // Every garment merged into this ONE output, in merge order.
   clothingPaths: string[]
@@ -182,6 +222,26 @@ export interface BoneTransformPayload {
   frame: 'unity'
 }
 
+// A scene read's per-source pick in the store's persisted-selection shape.
+function selectionFromRead(r: SceneSourceRead): PersistedSelection {
+  return {
+    droppedRoots: [...r.drop_mesh_ids],
+    droppedChannels: [],
+    channelOverrides: r.blend_shape_channel_overrides.map(
+      (o) => [o.channel_id, o.deform_percent] as [number, number],
+    ),
+    boneTransforms: r.bone_transforms.map((m) => [m.bone_id, {
+      position: m.position, rotation: m.rotation, scale: m.scale,
+    }] as [number, BoneTransformValue]),
+  }
+}
+
+// A prop hangs from an attach bone and is placed in the target's Armature
+// frame: a rigid garment (no bones) or a self-rigged one (own armature).
+export function isProp(inspect: InspectedClothing | null | undefined): boolean {
+  return !!(inspect?.rigid || inspect?.self_rigged)
+}
+
 export function boneTransformPayload(
   moves: Map<number, BoneTransformValue>,
 ): BoneTransformPayload[] {
@@ -196,6 +256,7 @@ export function boneTransformPayload(
 interface PersistedSnapshot {
   targetId: string | null
   translateTargetMorphs?: boolean
+  unityScene?: UnitySceneReport | null
   target: ({ avatarId: string | null } & PersistedSelection) | null
   clothings: ({ path: string; attachBoneId?: number | null } & PersistedSelection)[]
 }
@@ -223,23 +284,49 @@ export const useComposeStore = defineStore('compose', () => {
     boneTransforms: new Map(),
   })
 
-  // Set by _hydrate(); consumed by the next loadTargetInspect for the matching
-  // avatar so a restored target-strip survives the inspect reset. One-shot.
+  // The last Unity scene loaded into the page (its read report).
+  const unityScene = ref<UnitySceneReport | null>(null)
+  const unitySceneLoading = ref(false)
+  const unitySceneError = ref<string | null>(null)
+
+  // Set by hydrate() (and by loadUnityScene); consumed by the next
+  // loadTargetInspect for the matching avatar so a restored target-strip
+  // survives the inspect reset. One-shot.
   let pendingTargetRestore: ({ avatarId: string } & PersistedSelection) | null = null
+  // The target inspect in flight, so a second call for the same avatar (the
+  // Compose page's targetId watcher) joins it instead of wiping its result.
+  let targetLoad: Promise<void> | null = null
+  let targetLoadFor: string | null = null
   // While true, persistence writes are suppressed so the initial restore can't
   // overwrite the saved snapshot with half-built state.
   let hydrating = false
 
-  async function loadTargetInspect(avatarId: string): Promise<void> {
+  function loadTargetInspect(avatarId: string): Promise<void> {
+    if (targetLoad && targetLoadFor === avatarId) return targetLoad
+    // Already showing this avatar with nothing to restore: nothing to do.
+    if (target.avatarId === avatarId && target.inspect && !target.loading
+        && !(pendingTargetRestore && pendingTargetRestore.avatarId === avatarId)) {
+      return Promise.resolve()
+    }
+    targetLoadFor = avatarId
+    targetLoad = _loadTargetInspect(avatarId).finally(() => {
+      targetLoad = null
+      targetLoadFor = null
+    })
+    return targetLoad
+  }
+
+  async function _loadTargetInspect(avatarId: string): Promise<void> {
     // An attach pick names a bone id of the PREVIOUS avatar; drop it on a
     // switch (a reload re-picks the same avatar and keeps it).
     if (target.avatarId !== null && target.avatarId !== avatarId) {
       for (const c of clothings) c.attachBoneId = null
     }
-    // A rigid garment's Move prefill is in the target's Armature frame:
-    // re-inspect those against the new avatar.
+    // A prop's Move prefill is in the target's Armature frame (and whether a
+    // garment is self-rigged depends on the target): re-inspect against the
+    // new avatar.
     if (target.avatarId !== avatarId) {
-      for (const c of clothings) if (c.inspect?.rigid) inspect(c)
+      for (const c of clothings) if (isProp(c.inspect)) inspect(c)
     }
     target.avatarId = avatarId
     target.loading = true
@@ -333,9 +420,67 @@ export const useComposeStore = defineStore('compose', () => {
     } finally {
       c.loading = false
     }
-    // The target changed while this was in flight: a rigid garment's prefill
-    // is per target, so ask again.
-    if (c.inspect?.rigid && targetId.value !== forTarget) await inspect(c)
+    // The target changed while this was in flight: a prop's prefill is per
+    // target, so ask again.
+    if (isProp(c.inspect) && targetId.value !== forTarget) await inspect(c)
+  }
+
+  // Read kevin's saved Unity scene and REPLACE the compose with it: the
+  // scene's avatar becomes the target (with its hidden meshes / blendshape
+  // values / moves), and each garment FBX is added with its own. Nothing on
+  // the page changes when the read fails.
+  async function loadUnityScene(path: string): Promise<boolean> {
+    const scenePath = path.trim().replace(/^"|"$/g, '')
+    if (!scenePath) return false
+    unitySceneLoading.value = true
+    unitySceneError.value = null
+    try {
+      const res = await fetch(`${API_BASE}/api/unity/scene`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scene_path: scenePath }),
+      })
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`
+        try {
+          const body = await res.json()
+          if (body && typeof body.detail === 'string') detail = body.detail
+        } catch { /* not JSON */ }
+        throw new Error(detail)
+      }
+      const read = (await res.json()) as UnitySceneRead
+
+      // Target first: its inspect drops attach picks on an avatar switch.
+      clothings.splice(0, clothings.length)
+      pendingTargetRestore = { avatarId: read.target_id, ...selectionFromRead(read.target) }
+      const load = loadTargetInspect(read.target_id)
+      targetId.value = read.target_id
+      await nextTick()
+      await load
+
+      for (const c of read.clothings) {
+        const sel = selectionFromRead(c)
+        clothings.push({
+          path: c.clothing_path,
+          loading: true,
+          error: null,
+          inspect: null,
+          droppedRoots: new Set(sel.droppedRoots),
+          droppedChannels: new Set(sel.droppedChannels),
+          channelOverrides: new Map(sel.channelOverrides),
+          boneTransforms: new Map(sel.boneTransforms ?? []),
+          attachBoneId: c.attach_to_bone_id ?? null,
+        })
+        inspect(clothings[clothings.length - 1])
+      }
+      unityScene.value = { path: scenePath, notes: read.notes, skipped: read.skipped }
+      return true
+    } catch (e) {
+      unitySceneError.value = e instanceof Error ? e.message : String(e)
+      return false
+    } finally {
+      unitySceneLoading.value = false
+    }
   }
 
   // Geometry pre-step (taste-edit): cut a mesh's sole height via the headless
@@ -466,7 +611,7 @@ export const useComposeStore = defineStore('compose', () => {
         ([channel_id, deform_percent]) => ({ channel_id, deform_percent }),
       ),
       bone_transforms: boneTransformPayload(c.boneTransforms),
-      attach_to_bone_id: c.inspect?.rigid ? c.attachBoneId : null,
+      attach_to_bone_id: isProp(c.inspect) ? c.attachBoneId : null,
     }))
     const paths = active.map((c) => c.path)
     // Any failure voids the whole run (no file is written): every row fails,
@@ -606,6 +751,7 @@ export const useComposeStore = defineStore('compose', () => {
     return {
       targetId: targetId.value,
       translateTargetMorphs: translateTargetMorphs.value,
+      unityScene: unityScene.value,
       target: target.avatarId
         ? {
             avatarId: target.avatarId,
@@ -653,6 +799,7 @@ export const useComposeStore = defineStore('compose', () => {
     if (typeof snap.translateTargetMorphs === 'boolean') {
       translateTargetMorphs.value = snap.translateTargetMorphs
     }
+    if (snap.unityScene) unityScene.value = snap.unityScene
     if (snap.target?.avatarId) {
       pendingTargetRestore = {
         avatarId: snap.target.avatarId,
@@ -683,12 +830,16 @@ export const useComposeStore = defineStore('compose', () => {
   hydrate()
   // Deep-watch the selection-bearing state; serialize on any change. inspect
   // payloads aren't in the snapshot, so inspect resolutions don't churn writes.
-  watch([targetId, translateTargetMorphs, target, clothings], persist, { deep: true })
+  watch([targetId, translateTargetMorphs, target, clothings, unityScene], persist, { deep: true })
 
   return {
     targetId,
     translateTargetMorphs,
     target,
+    unityScene,
+    unitySceneLoading,
+    unitySceneError,
+    loadUnityScene,
     clothings,
     assembling,
     results,
